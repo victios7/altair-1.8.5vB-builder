@@ -1,3 +1,6 @@
+#ifdef __linux__
+#define _GNU_SOURCE   /* needed for O_DIRECT (draw(), raw LBA block access) */
+#endif
 #define _POSIX_C_SOURCE 200809L
 #include "altair_rt.h"
 #include <stdio.h>
@@ -15,12 +18,6 @@
 #include <ctype.h>
 
 #ifndef DISABLE_FNUMLIST
-/* Fast Numeric List */
-typedef struct {
-    double *items;
-    int     len;
-    int     cap;
-} AltairFNumList;
 
 AltairFNumList *altair_fnumlist_new(void) {
     AltairFNumList *list = (AltairFNumList*)malloc(sizeof(AltairFNumList));
@@ -54,15 +51,9 @@ AltairVal *altair_fnumlist_to_val(AltairFNumList *list) {
     }
     return val;
 }
-#endif  // DISABLE_FNUMLIST
+#endif
 
 #ifndef DISABLE_SB
-/* String Builder */
-typedef struct {
-    char   *buf;
-    size_t  len;
-    size_t  cap;
-} AltairSB;
 
 AltairSB *altair_sb_new(void) {
     AltairSB *sb = (AltairSB*)malloc(sizeof(AltairSB));
@@ -103,7 +94,7 @@ AltairVal *altair_sb_to_val(AltairSB *sb) {
     if (!sb) return altair_str("");
     return altair_str_own(strdup(sb->buf));
 }
-#endif  // DISABLE_SB
+#endif
 
 static void altair_persist_save_all(void);
 
@@ -117,6 +108,10 @@ static void altair_persist_save_all(void);
 #  include <arpa/inet.h>
 #  include <signal.h>
 #  include <pthread.h>
+#  include <fcntl.h>
+#  include <sys/ioctl.h>
+#  include <linux/fs.h>
+#  define ALT_LBA_RAW_SUPPORTED 1
 #elif defined(__APPLE__)
 #  include <sys/mman.h>
 #  include <mach/mach.h>
@@ -369,16 +364,22 @@ static void val_pool_free(AltairVal *v) {
 
 AltairVal *altair_num(double n) {
     AltairVal *v = val_pool_alloc();
-    v->type = ALT_NUMERIC; v->num = n; return v;
+    v->type = ALT_NUMERIC; v->num = n; v->num_is_int = 0; v->num_i64 = 0;
+    return v;
+}
+AltairVal *altair_num_i64(long long n) {
+    AltairVal *v = val_pool_alloc();
+    v->type = ALT_NUMERIC; v->num = (double)n; v->num_is_int = 1; v->num_i64 = n;
+    return v;
 }
 AltairVal *altair_str(const char *s) {
     AltairVal *v = val_pool_alloc();
-    v->type = ALT_TEXT; v->str = strdup(s ? s : ""); return v;
+    v->type = ALT_TEXT; v->str = strdup(s ? s : ""); v->str_cap = strlen(v->str)+1; return v;
 }
 
 AltairVal *altair_str_own(char *s) {
     AltairVal *v = val_pool_alloc();
-    v->type = ALT_TEXT; v->str = s ? s : strdup(""); return v;
+    v->type = ALT_TEXT; v->str = s ? s : strdup(""); v->str_cap = strlen(v->str)+1; return v;
 }
 AltairVal *altair_bool(int b) {
     AltairVal *v = val_pool_alloc();
@@ -399,7 +400,7 @@ AltairVal *altair_val_copy(const AltairVal *v) {
     if (!v) return altair_num(0);
     AltairVal *c = val_pool_alloc();
     *c = *v;
-    if (v->type==ALT_TEXT)  c->str = strdup(v->str ? v->str : "");
+    if (v->type==ALT_TEXT)  { c->str = strdup(v->str ? v->str : ""); c->str_cap = strlen(c->str)+1; }
     if (v->type==ALT_LIST) {
         c->list.items = (AltairVal**)malloc(sizeof(AltairVal*)*(v->list.cap>0?v->list.cap:1));
         c->list.cap   = v->list.cap>0?v->list.cap:1;
@@ -447,7 +448,9 @@ char *altair_val_tostr(const AltairVal *v) {
     char buf[256];
     switch (v->type) {
     case ALT_NUMERIC:
-        if (v->num == (long long)v->num)
+        if (v->num_is_int)
+            snprintf(buf, sizeof(buf), "%lld", v->num_i64);
+        else if (v->num == (long long)v->num)
             snprintf(buf, sizeof(buf), "%lld", (long long)v->num);
         else
             snprintf(buf, sizeof(buf), "%g", v->num);
@@ -618,11 +621,128 @@ AltairVal *altair_var_get(AltairVar *v) {
     return v->val;
 }
 
+/* C2: append `addend`'s text form onto `dst`, growing dst's buffer with
+   amortized doubling instead of allocating a whole new string every call.
+   Takes ownership of both dst and addend; always returns the same pointer
+   as dst (mutated in place) when dst is non-NULL, so callers never need to
+   distinguish an in-place update from a fresh allocation. */
+AltairVal *altair_text_append_owned(AltairVal *dst, AltairVal *addend) {
+    char *add_str = altair_val_tostr(addend);
+    altair_val_free(addend);
+    size_t add_len = strlen(add_str);
+
+    if (!dst) {
+        AltairVal *v = altair_str_own(add_str);
+        v->str_cap = add_len + 1;
+        return v;
+    }
+
+    if (dst->type != ALT_TEXT) {
+        char *base = altair_val_tostr(dst);
+        if (dst->type==ALT_LIST) {
+            for (int i=0;i<dst->list.len;i++) altair_val_free(dst->list.items[i]);
+            free(dst->list.items);
+        } else if (dst->type==ALT_TOKEN) {
+            altair_val_free(dst->tok.inner);
+        } else if (dst->type==ALT_OBJECT && dst->obj) {
+            altair_obj_free(dst->obj);
+        }
+        size_t base_len = strlen(base);
+        size_t total = base_len + add_len + 1;
+        char *buf = (char*)malloc(total);
+        memcpy(buf, base, base_len);
+        memcpy(buf+base_len, add_str, add_len+1);
+        free(base); free(add_str);
+        dst->type = ALT_TEXT;
+        dst->str = buf;
+        dst->str_cap = total;
+        return dst;
+    }
+
+    size_t cur_len = dst->str ? strlen(dst->str) : 0;
+    size_t need = cur_len + add_len + 1;
+    if (need > dst->str_cap) {
+        size_t newcap = dst->str_cap ? dst->str_cap : (cur_len + 1);
+        if (newcap < 8) newcap = 8;
+        while (newcap < need) newcap *= 2;
+        char *nb = (char*)realloc(dst->str, newcap);
+        if (nb) { dst->str = nb; dst->str_cap = newcap; }
+    }
+    if (dst->str_cap >= need) {
+        memcpy(dst->str + cur_len, add_str, add_len + 1);
+    }
+    free(add_str);
+    return dst;
+}
+
+/* C2: implements "var += addend" for both text (in-place, amortized growth)
+   and numeric (plain altair_add) operands, deciding at runtime since Altair
+   is dynamically typed. Takes ownership of addend. */
+void altair_var_plus_assign(AltairVar *v, AltairVal *addend, int line) {
+    if (!v) { altair_val_free(addend); return; }
+    check_expire(v);
+    if (v->is_const && v->val) {
+        altair_val_free(addend);
+        altair_throw("ALT0007", "Cannot reassign a const variable.", 0);
+        return;
+    }
+    AltairVal *cur = altair_var_get(v);
+    if (cur->type == ALT_TEXT || (addend && addend->type == ALT_TEXT)) {
+        v->val = altair_text_append_owned(cur, addend);
+    } else {
+        AltairVal *result = altair_add(cur, addend, line);
+        altair_val_free(addend);
+        altair_val_free(cur);
+        v->val = result;
+    }
+    if (v->storage==ALT_DISK || v->storage==ALT_CACHE)
+        altair_disk_save(v->name, v->val, v->storage, v->expire_at);
+}
+
+#define ALT_POINT_MAX 256
+static void *g_point_registry[ALT_POINT_MAX];
+static int g_point_n = 0;
+
+AltairVal *altair_point(AltairVar *v) {
+    if (!v) { altair_throw("ALT_POINT_UNKNOWN","Unknown variable in system@point().",0); return altair_num(0); }
+    for (int i=0;i<g_point_n;i++) if (g_point_registry[i]==(void*)v) return altair_num((double)(uintptr_t)v);
+    if (g_point_n<ALT_POINT_MAX) g_point_registry[g_point_n++]=(void*)v;
+    return altair_num((double)(uintptr_t)v);
+}
+
+AltairVal *altair_unpoint(double addr) {
+    uintptr_t target=(uintptr_t)addr;
+    for (int i=0;i<g_point_n;i++) {
+        if ((uintptr_t)g_point_registry[i]==target) {
+            AltairVar *v=(AltairVar*)g_point_registry[i];
+            return altair_val_copy(altair_var_get(v));
+        }
+    }
+    altair_throw("ALT_UNPOINT_INVALID","Address was not produced by system@point().",0);
+    return altair_num(0);
+}
+
 void altair_var_release(AltairVar **vp) {
     if (!vp || !*vp) return;
     AltairVar *v = *vp;
     altair_var_unregister(v->name);
     if (v->val) { altair_val_free(v->val); v->val = NULL; }
+    if (v->storage == ALT_TEMP) {
+        memset(v, 0, sizeof(AltairVar));
+        free(v);
+    } else if (v->storage == ALT_RAM) {
+        ram_free(v, sizeof(AltairVar));
+    } else {
+        free(v);
+    }
+    *vp = NULL;
+}
+
+void altair_var_release_view(AltairVar **vp) {
+    if (!vp || !*vp) return;
+    AltairVar *v = *vp;
+    altair_var_unregister(v->name);
+    v->val = NULL;
     if (v->storage == ALT_TEMP) {
         memset(v, 0, sizeof(AltairVar));
         free(v);
@@ -1254,7 +1374,7 @@ AltairVal *altair_system(const char *key) {
 }
 
 AltairVal *altair_compiler(const char *key) {
-    if(strcmp(key,"version")==0)      return altair_str("1.8");
+    if(strcmp(key,"version")==0)      return altair_str("1.8.5");
     if(strcmp(key,"name")==0)         return altair_str("altairc");
     if(strcmp(key,"build")==0)        return altair_str(__DATE__);
     if(strcmp(key,"architecture")==0){
@@ -1424,7 +1544,7 @@ static void parse_request(int fd, AltairRequest *req) {
 static void send_response(int fd, AltairResponse *res) {
     char header[1024];
     int hl=snprintf(header, sizeof(header),
-        "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\nX-Powered-By: Altair/1.8\r\n\r\n",
+        "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\nX-Powered-By: Altair/1.8.5\r\n\r\n",
         res->status,
         res->status==200?"OK":res->status==201?"Created":res->status==401?"Unauthorized":
         res->status==404?"Not Found":res->status==429?"Too Many Requests":"Error",
@@ -1706,7 +1826,7 @@ void altair_jobs_tick(void) {
 
 static long long altair_as_int(AltairVal *v) {
     if (!v) return 0;
-    if (v->type==ALT_NUMERIC) return (long long)v->num;
+    if (v->type==ALT_NUMERIC) return v->num_is_int ? v->num_i64 : (long long)v->num;
     if (v->type==ALT_BOOL)    return v->boolean ? 1 : 0;
     return 0;
 }
@@ -1813,18 +1933,21 @@ static const char *altair_storage_path(const char *rel) {
 }
 
 AltairVal *_fn_open(AltairVal *path) {
-    if (!path || path->type!=ALT_TEXT) return altair_new_file(NULL);
+    if (!path || path->type!=ALT_TEXT) { altair_val_free(path); return altair_new_file(NULL); }
     FILE *fp=fopen(altair_storage_path(path->str),"r");
+    altair_val_free(path);
     return altair_new_file(fp);
 }
 AltairVal *_fn_open_write(AltairVal *path) {
-    if (!path || path->type!=ALT_TEXT) return altair_new_file(NULL);
+    if (!path || path->type!=ALT_TEXT) { altair_val_free(path); return altair_new_file(NULL); }
     FILE *fp=fopen(altair_storage_path(path->str),"w");
+    altair_val_free(path);
     return altair_new_file(fp);
 }
 AltairVal *_fn_open_append(AltairVal *path) {
-    if (!path || path->type!=ALT_TEXT) return altair_new_file(NULL);
+    if (!path || path->type!=ALT_TEXT) { altair_val_free(path); return altair_new_file(NULL); }
     FILE *fp=fopen(altair_storage_path(path->str),"a");
+    altair_val_free(path);
     return altair_new_file(fp);
 }
 AltairVal *_fn_read(AltairVal *file) {
@@ -1850,10 +1973,11 @@ AltairVal *_fn_read_line(AltairVal *file) {
     return altair_str(buf);
 }
 AltairVal *_fn_write(AltairVal *file, AltairVal *text) {
-    if (!file || file->type!=ALT_FILE || !file->ptr) return altair_bool(0);
+    if (!file || file->type!=ALT_FILE || !file->ptr) { altair_val_free(text); return altair_bool(0); }
     char *s=altair_val_tostr(text);
     fputs(s,(FILE*)file->ptr);
     free(s);
+    altair_val_free(text);
     return altair_bool(1);
 }
 AltairVal *_fn_close(AltairVal *file) {
@@ -1864,33 +1988,42 @@ AltairVal *_fn_close(AltairVal *file) {
     return altair_bool(1);
 }
 AltairVal *_fn_create_file(AltairVal *path) {
-    if (!path || path->type!=ALT_TEXT) return altair_bool(0);
+    if (!path || path->type!=ALT_TEXT) { altair_val_free(path); return altair_bool(0); }
     FILE *fp=fopen(altair_storage_path(path->str),"a");
+    altair_val_free(path);
     if (!fp) return altair_bool(0);
     fclose(fp);
     return altair_bool(1);
 }
 AltairVal *_fn_delete_file(AltairVal *path) {
-    if (!path || path->type!=ALT_TEXT) return altair_bool(0);
-    return altair_bool(remove(altair_storage_path(path->str))==0);
+    if (!path || path->type!=ALT_TEXT) { altair_val_free(path); return altair_bool(0); }
+    int rc = remove(altair_storage_path(path->str));
+    altair_val_free(path);
+    return altair_bool(rc==0);
 }
 AltairVal *_fn_mkdir(AltairVal *path) {
-    if (!path || path->type!=ALT_TEXT) return altair_bool(0);
+    if (!path || path->type!=ALT_TEXT) { altair_val_free(path); return altair_bool(0); }
 #ifdef _WIN32
-    return altair_bool(mkdir(altair_storage_path(path->str))==0 || errno==EEXIST);
+    int rc = mkdir(altair_storage_path(path->str));
 #else
-    return altair_bool(mkdir(altair_storage_path(path->str),0755)==0 || errno==EEXIST);
+    int rc = mkdir(altair_storage_path(path->str),0755);
 #endif
+    int ok = (rc==0 || errno==EEXIST);
+    altair_val_free(path);
+    return altair_bool(ok);
 }
 AltairVal *_fn_file_exists(AltairVal *path) {
-    if (!path || path->type!=ALT_TEXT) return altair_bool(0);
+    if (!path || path->type!=ALT_TEXT) { altair_val_free(path); return altair_bool(0); }
     struct stat st;
-    return altair_bool(stat(altair_storage_path(path->str),&st)==0);
+    int rc = stat(altair_storage_path(path->str),&st);
+    altair_val_free(path);
+    return altair_bool(rc==0);
 }
 AltairVal *_fn_list_dir(AltairVal *path) {
     AltairVal *list=altair_list_new();
-    if (!path || path->type!=ALT_TEXT) return list;
+    if (!path || path->type!=ALT_TEXT) { altair_val_free(path); return list; }
     DIR *d=opendir(altair_storage_path(path->str));
+    altair_val_free(path);
     if (!d) return list;
     struct dirent *ent;
     while ((ent=readdir(d))!=NULL) {
@@ -1904,13 +2037,15 @@ AltairVal *_fn_list_dir(AltairVal *path) {
 }
 
 AltairVal *_fn_exec(AltairVal *cmd) {
-    if (!cmd || cmd->type!=ALT_TEXT) return altair_num(-1);
+    if (!cmd || cmd->type!=ALT_TEXT) { altair_val_free(cmd); return altair_num(-1); }
     int rc=system(cmd->str);
+    altair_val_free(cmd);
     return altair_num((double)rc);
 }
 AltairVal *_fn_exec_capture(AltairVal *cmd) {
-    if (!cmd || cmd->type!=ALT_TEXT) return altair_str("");
+    if (!cmd || cmd->type!=ALT_TEXT) { altair_val_free(cmd); return altair_str(""); }
     FILE *fp=popen(cmd->str,"r");
+    altair_val_free(cmd);
     if (!fp) return altair_str("");
     size_t cap=4096, len=0;
     char *buf=(char*)malloc(cap);
@@ -1928,6 +2063,7 @@ AltairVal *_fn_exec_capture(AltairVal *cmd) {
 
 AltairVal *_fn_ptr_alloc(AltairVal *size) {
     long long n = size ? altair_as_int(size) : 0;
+    altair_val_free(size);
     if (n<=0) n=1;
     void *p=calloc((size_t)n,1);
     if (!p) altair_throw("ALT0017","Pointer allocation failed.",0);
@@ -1935,17 +2071,21 @@ AltairVal *_fn_ptr_alloc(AltairVal *size) {
     return altair_new_ptr(p);
 }
 AltairVal *_fn_ptr_free(AltairVal *p) {
-    if (!p || p->type!=ALT_POINTER || !p->ptr) return altair_bool(0);
+    if (!p || p->type!=ALT_POINTER || !p->ptr) { altair_val_free(p); return altair_bool(0); }
     if (!alt_ptr_release(p->ptr)) {
         altair_throw("ALT0018","Double free or invalid pointer.",0);
+        altair_val_free(p);
         return altair_bool(0);
     }
     free(p->ptr);
     p->ptr=NULL;
+    altair_val_free(p);
     return altair_bool(1);
 }
 AltairVal *_fn_ptr_is_null(AltairVal *p) {
-    return altair_bool(!p || p->type!=ALT_POINTER || p->ptr==NULL || alt_ptr_valid_size(p->ptr)==0);
+    int r = !p || p->type!=ALT_POINTER || p->ptr==NULL || alt_ptr_valid_size(p->ptr)==0;
+    altair_val_free(p);
+    return altair_bool(r);
 }
 
 static int    _alt_argc = 0;
@@ -1954,6 +2094,7 @@ void altair_set_args(int argc, char **argv) { _alt_argc=argc; _alt_argv=argv; }
 AltairVal *_fn_argc(void) { return altair_num((double)_alt_argc); }
 AltairVal *_fn_arg(AltairVal *idx) {
     long long i = idx ? altair_as_int(idx) : 0;
+    altair_val_free(idx);
     if (i<0 || i>=_alt_argc) return altair_str("");
     return altair_str(_alt_argv[i]);
 }
@@ -2024,6 +2165,7 @@ static void altair_persist_save_all(void) {
 
 AltairVal *_fn_alloc(AltairVal *size) {
     long long n = size ? altair_as_int(size) : 0;
+    altair_val_free(size);
     if (n<=0) n=8;
     void *raw = calloc(1,(size_t)n);
     if (!raw) { altair_throw("ALT0017","Pointer allocation failed.",0); return altair_new_ptr(NULL); }
@@ -2031,13 +2173,16 @@ AltairVal *_fn_alloc(AltairVal *size) {
     return altair_new_ptr(raw);
 }
 AltairVal *_fn_p_bytes(AltairVal *p) {
-    if (!p||p->type!=ALT_POINTER||!p->ptr) return altair_num(0);
+    if (!p||p->type!=ALT_POINTER||!p->ptr) { altair_val_free(p); return altair_num(0); }
     size_t n=alt_ptr_valid_size(p->ptr);
-    if (n==0) { altair_throw("ALT0018","Use of freed or invalid pointer.",0); return altair_num(0); }
+    if (n==0) { altair_throw("ALT0018","Use of freed or invalid pointer.",0); altair_val_free(p); return altair_num(0); }
+    altair_val_free(p);
     return altair_num((double)n);
 }
 AltairVal *_fn_p_null(AltairVal *p) {
-    return altair_bool(!p||p->type!=ALT_POINTER||p->ptr==NULL||alt_ptr_valid_size(p->ptr)==0);
+    int r = !p||p->type!=ALT_POINTER||p->ptr==NULL||alt_ptr_valid_size(p->ptr)==0;
+    altair_val_free(p);
+    return altair_bool(r);
 }
 AltairVal *_fn_p_free(AltairVal *p) {
     if (!p||p->type!=ALT_POINTER||!p->ptr) return altair_bool(0);
@@ -2050,28 +2195,278 @@ AltairVal *_fn_p_free(AltairVal *p) {
     return altair_bool(1);
 }
 AltairVal *_fn_p_write(AltairVal *p, AltairVal *offset, AltairVal *val) {
-    if (!p||p->type!=ALT_POINTER||!p->ptr) return altair_bool(0);
+    if (!p||p->type!=ALT_POINTER||!p->ptr) { altair_val_free(offset); altair_val_free(val); return altair_bool(0); }
     size_t n=alt_ptr_valid_size(p->ptr);
-    if (n==0) { altair_throw("ALT0018","Use of freed or invalid pointer.",0); return altair_bool(0); }
+    if (n==0) { altair_throw("ALT0018","Use of freed or invalid pointer.",0); altair_val_free(offset); altair_val_free(val); return altair_bool(0); }
     long long off = offset?altair_as_int(offset):0;
-    if (off<0 || (size_t)((off+1)*8)>n) { altair_throw("ALT0019","Pointer write out of bounds.",0); return altair_bool(0); }
+    if (off<0 || (size_t)((off+1)*8)>n) { altair_throw("ALT0019","Pointer write out of bounds.",0); altair_val_free(offset); altair_val_free(val); return altair_bool(0); }
     double v = (val&&val->type==ALT_NUMERIC) ? val->num : 0.0;
     ((double*)p->ptr)[off]=v;
+    altair_val_free(offset); altair_val_free(val);
     return altair_bool(1);
 }
 AltairVal *_fn_p_read(AltairVal *p, AltairVal *offset) {
-    if (!p||p->type!=ALT_POINTER||!p->ptr) return altair_num(0);
+    if (!p||p->type!=ALT_POINTER||!p->ptr) { altair_val_free(p); altair_val_free(offset); return altair_num(0); }
     size_t n=alt_ptr_valid_size(p->ptr);
-    if (n==0) { altair_throw("ALT0018","Use of freed or invalid pointer.",0); return altair_num(0); }
+    if (n==0) { altair_throw("ALT0018","Use of freed or invalid pointer.",0); altair_val_free(p); altair_val_free(offset); return altair_num(0); }
     long long off = offset?altair_as_int(offset):0;
-    if (off<0 || (size_t)((off+1)*8)>n) { altair_throw("ALT0019","Pointer read out of bounds.",0); return altair_num(0); }
-    return altair_num(((double*)p->ptr)[off]);
+    if (off<0 || (size_t)((off+1)*8)>n) { altair_throw("ALT0019","Pointer read out of bounds.",0); altair_val_free(p); altair_val_free(offset); return altair_num(0); }
+    double r=((double*)p->ptr)[off];
+    altair_val_free(p); altair_val_free(offset);
+    return altair_num(r);
+}
+
+/* lba%: disk-backed counterpart to p#. Same 8-byte-slot addressing and the
+   same bounds/validity checks, but the backing store is a FILE* on disk
+   instead of a malloc'd buffer, so writes survive past a single run when
+   made through dopen(). */
+typedef struct AltLbaEntry {
+    void *key;            /* opaque unique identity, stored in AltairVal->ptr */
+    FILE *fp;              /* used for dalloc()/dopen() nodes */
+    int fd;                 /* used for draw() raw-device nodes, else -1 */
+    int is_raw;            /* 1 = real O_DIRECT block device */
+    size_t sector_size;    /* raw nodes only: real logical sector size */
+    size_t bytes; char *path; int is_tmp;
+    struct AltLbaEntry *next;
+} AltLbaEntry;
+static AltLbaEntry *g_lba_table[ALT_PTR_TABLE_BUCKETS];
+
+static void alt_lba_register(void *key, FILE *fp, int fd, int is_raw, size_t sector_size,
+                              size_t bytes, const char *path, int is_tmp) {
+    unsigned h = alt_ptr_hash(key);
+    AltLbaEntry *e = (AltLbaEntry*)malloc(sizeof(AltLbaEntry));
+    e->key=key; e->fp=fp; e->fd=fd; e->is_raw=is_raw; e->sector_size=sector_size;
+    e->bytes=bytes; e->path=path?strdup(path):NULL; e->is_tmp=is_tmp;
+    e->next=g_lba_table[h]; g_lba_table[h]=e;
+}
+static AltLbaEntry *alt_lba_find(void *key) {
+    if (!key) return NULL;
+    unsigned h = alt_ptr_hash(key);
+    for (AltLbaEntry *e=g_lba_table[h]; e; e=e->next) if (e->key==key) return e;
+    return NULL;
+}
+static int alt_lba_release(void *key) {
+    if (!key) return 0;
+    unsigned h = alt_ptr_hash(key);
+    AltLbaEntry **pp = &g_lba_table[h];
+    while (*pp) {
+        if ((*pp)->key==key) {
+            AltLbaEntry *dead=*pp; *pp=dead->next;
+            if (dead->is_tmp && dead->path) remove(dead->path);
+            free(dead->path); free(dead);
+            return 1;
+        }
+        pp=&(*pp)->next;
+    }
+    return 0;
+}
+static void alt_lba_grow_file(FILE *fp, size_t bytes) {
+    /* make sure the file is at least `bytes` long, zero-filled past EOF */
+    fseek(fp,0,SEEK_END);
+    long cur=ftell(fp);
+    if (cur<0) cur=0;
+    if ((size_t)cur<bytes) {
+        static const char zero[4096]={0};
+        size_t remain=bytes-(size_t)cur;
+        while (remain>0) {
+            size_t chunk = remain<sizeof(zero)?remain:sizeof(zero);
+            fwrite(zero,1,chunk,fp);
+            remain-=chunk;
+        }
+        fflush(fp);
+    }
+}
+
+AltairVal *altair_new_lba(void *fp) {
+    AltairVal *v=(AltairVal*)malloc(sizeof(AltairVal));
+    v->type=ALT_LBA; v->ptr=fp;
+    return v;
+}
+AltairVal *_fn_dalloc(AltairVal *size) {
+    long long n = size ? altair_as_int(size) : 0;
+    altair_val_free(size);
+    if (n<=0) n=8;
+    FILE *fp = tmpfile();
+    if (!fp) { altair_throw("ALT0017","LBA allocation failed.",0); return altair_new_lba(NULL); }
+    alt_lba_grow_file(fp,(size_t)n);
+    alt_lba_register((void*)fp,fp,-1,0,0,(size_t)n,NULL,1);
+    return altair_new_lba(fp);
+}
+AltairVal *_fn_dopen(AltairVal *path, AltairVal *size) {
+    long long n = size ? altair_as_int(size) : 0;
+    altair_val_free(size);
+    if (n<=0) n=8;
+    if (!path || path->type!=ALT_TEXT || !path->str) {
+        altair_val_free(path);
+        altair_throw("ALT0017","dopen() requires a text path.",0);
+        return altair_new_lba(NULL);
+    }
+    FILE *fp = fopen(path->str,"r+b");
+    if (!fp) fp = fopen(path->str,"w+b");
+    if (!fp) {
+        altair_throw("ALT0017","LBA disk allocation failed.",0);
+        altair_val_free(path);
+        return altair_new_lba(NULL);
+    }
+    alt_lba_grow_file(fp,(size_t)n);
+    alt_lba_register((void*)fp,fp,-1,0,0,(size_t)n,path->str,0);
+    altair_val_free(path);
+    return altair_new_lba(fp);
+}
+
+/* draw(): opens a REAL block device (/dev/...) with O_DIRECT, bypassing the
+   page cache, and reads its true size/sector size from the kernel. Every
+   lba_read/lba_write on such a node does an aligned, whole-sector
+   read-modify-write with posix_memalign'd buffers, since O_DIRECT forbids
+   sub-sector or misaligned I/O. Linux only; refuses anything not under
+   /dev/ so it can't be pointed at an ordinary file by accident. */
+AltairVal *_fn_draw(AltairVal *path) {
+#ifdef ALT_LBA_RAW_SUPPORTED
+    if (!path || path->type!=ALT_TEXT || !path->str) {
+        altair_val_free(path);
+        altair_throw("ALT0017","draw() requires a text device path.",0);
+        return altair_new_lba(NULL);
+    }
+    if (strncmp(path->str,"/dev/",5)!=0) {
+        altair_throw("ALT0017","draw() only accepts a raw block device path under /dev/.",0);
+        altair_val_free(path);
+        return altair_new_lba(NULL);
+    }
+    int fd = open(path->str, O_RDWR | O_DIRECT);
+    if (fd<0) {
+        altair_throw("ALT0017","Could not open block device (need permission / not a block device?).",0);
+        altair_val_free(path);
+        return altair_new_lba(NULL);
+    }
+    unsigned long ssz = 512;
+    if (ioctl(fd, BLKSSZGET, &ssz)!=0 || ssz==0) ssz = 512;
+    unsigned long long total = 0;
+    if (ioctl(fd, BLKGETSIZE64, &total)!=0) {
+        close(fd);
+        altair_throw("ALT0017","Could not read block device size (BLKGETSIZE64).",0);
+        altair_val_free(path);
+        return altair_new_lba(NULL);
+    }
+    void *key = malloc(1);
+    alt_lba_register(key, NULL, fd, 1, (size_t)ssz, (size_t)total, path->str, 0);
+    altair_val_free(path);
+    return altair_new_lba(key);
+#else
+    altair_val_free(path);
+    altair_throw("ALT0017","draw() (raw LBA block device access) is only supported on Linux.",0);
+    return altair_new_lba(NULL);
+#endif
+}
+
+AltairVal *_fn_lba_bytes(AltairVal *p) {
+    if (!p||p->type!=ALT_LBA||!p->ptr) { altair_val_free(p); return altair_num(0); }
+    AltLbaEntry *e=alt_lba_find(p->ptr);
+    if (!e) { altair_throw("ALT0018","Use of freed or invalid LBA node.",0); altair_val_free(p); return altair_num(0); }
+    altair_val_free(p);
+    return altair_num((double)e->bytes);
+}
+AltairVal *_fn_lba_null(AltairVal *p) {
+    int r = !p||p->type!=ALT_LBA||p->ptr==NULL||alt_lba_find(p->ptr)==NULL;
+    altair_val_free(p);
+    return altair_bool(r);
+}
+AltairVal *_fn_lba_free(AltairVal *p) {
+    if (!p||p->type!=ALT_LBA||!p->ptr) return altair_bool(0);
+    void *key=p->ptr;
+    AltLbaEntry *e=alt_lba_find(key);
+    if (!e) { altair_throw("ALT0018","Double free or invalid LBA node.",0); return altair_bool(0); }
+    int was_raw = e->is_raw;
+#ifdef ALT_LBA_RAW_SUPPORTED
+    int fd = e->fd;
+#endif
+    FILE *fp = e->fp;
+    alt_lba_release(key);   /* unlink + free the entry first, then close the handle */
+    if (was_raw) {
+#ifdef ALT_LBA_RAW_SUPPORTED
+        close(fd);
+#endif
+        free(key);
+    } else {
+        fclose(fp);
+    }
+    p->ptr=NULL;
+    return altair_bool(1);
+}
+AltairVal *_fn_lba_write(AltairVal *p, AltairVal *offset, AltairVal *val) {
+    if (!p||p->type!=ALT_LBA||!p->ptr) { altair_val_free(offset); altair_val_free(val); return altair_bool(0); }
+    AltLbaEntry *e=alt_lba_find(p->ptr);
+    if (!e) { altair_throw("ALT0018","Use of freed or invalid LBA node.",0); altair_val_free(offset); altair_val_free(val); return altair_bool(0); }
+    long long off = offset?altair_as_int(offset):0;
+    if (off<0 || (size_t)((off+1)*8)>e->bytes) { altair_throw("ALT0019","LBA write out of bounds.",0); altair_val_free(offset); altair_val_free(val); return altair_bool(0); }
+    double v = (val&&val->type==ALT_NUMERIC) ? val->num : 0.0;
+
+#ifdef ALT_LBA_RAW_SUPPORTED
+    if (e->is_raw) {
+        size_t ss = e->sector_size;
+        long long sector = (off*8) / (long long)ss;
+        size_t within = (size_t)((off*8) % (long long)ss);
+        void *buf=NULL;
+        if (posix_memalign(&buf, ss, ss)!=0 || !buf) {
+            altair_throw("ALT0017","Aligned buffer allocation failed.",0);
+            altair_val_free(offset); altair_val_free(val); return altair_bool(0);
+        }
+        off_t at = (off_t)sector * (off_t)ss;
+        int ok=1;
+        if (pread(e->fd, buf, ss, at) != (ssize_t)ss) ok=0;
+        if (ok) {
+            memcpy((char*)buf+within, &v, sizeof(double));
+            if (pwrite(e->fd, buf, ss, at) != (ssize_t)ss) ok=0;
+        }
+        free(buf);
+        altair_val_free(offset); altair_val_free(val);
+        if (!ok) { altair_throw("ALT0019","Raw LBA sector I/O failed.",0); return altair_bool(0); }
+        return altair_bool(1);
+    }
+#endif
+    fseek(e->fp,(long)(off*8),SEEK_SET);
+    fwrite(&v,sizeof(double),1,e->fp);
+    fflush(e->fp);
+    altair_val_free(offset); altair_val_free(val);
+    return altair_bool(1);
+}
+AltairVal *_fn_lba_read(AltairVal *p, AltairVal *offset) {
+    if (!p||p->type!=ALT_LBA||!p->ptr) { altair_val_free(p); altair_val_free(offset); return altair_num(0); }
+    AltLbaEntry *e=alt_lba_find(p->ptr);
+    if (!e) { altair_throw("ALT0018","Use of freed or invalid LBA node.",0); altair_val_free(p); altair_val_free(offset); return altair_num(0); }
+    long long off = offset?altair_as_int(offset):0;
+    if (off<0 || (size_t)((off+1)*8)>e->bytes) { altair_throw("ALT0019","LBA read out of bounds.",0); altair_val_free(p); altair_val_free(offset); return altair_num(0); }
+    double r=0.0;
+
+#ifdef ALT_LBA_RAW_SUPPORTED
+    if (e->is_raw) {
+        size_t ss = e->sector_size;
+        long long sector = (off*8) / (long long)ss;
+        size_t within = (size_t)((off*8) % (long long)ss);
+        void *buf=NULL;
+        if (posix_memalign(&buf, ss, ss)!=0 || !buf) {
+            altair_throw("ALT0017","Aligned buffer allocation failed.",0);
+            altair_val_free(p); altair_val_free(offset); return altair_num(0);
+        }
+        off_t at = (off_t)sector * (off_t)ss;
+        if (pread(e->fd, buf, ss, at) == (ssize_t)ss)
+            memcpy(&r, (char*)buf+within, sizeof(double));
+        free(buf);
+        altair_val_free(p); altair_val_free(offset);
+        return altair_num(r);
+    }
+#endif
+    fseek(e->fp,(long)(off*8),SEEK_SET);
+    if (fread(&r,sizeof(double),1,e->fp)!=1) r=0.0;
+    altair_val_free(p); altair_val_free(offset);
+    return altair_num(r);
 }
 
 AltairVal *_fn_data_migrate(AltairVal *prefix, AltairVal *lugar) {
-    if (!prefix||prefix->type!=ALT_TEXT||!lugar||lugar->type!=ALT_TEXT) return altair_bool(0);
+    if (!prefix||prefix->type!=ALT_TEXT||!lugar||lugar->type!=ALT_TEXT) {
+        altair_val_free(prefix); altair_val_free(lugar); return altair_bool(0);
+    }
     DIR *d=opendir("variables");
-    if (!d) return altair_bool(0);
+    if (!d) { altair_val_free(prefix); altair_val_free(lugar); return altair_bool(0); }
     char pfx[300]; snprintf(pfx,sizeof(pfx),"%s.",prefix->str);
     size_t pfxlen=strlen(pfx);
     struct dirent *ent;
@@ -2090,5 +2485,6 @@ AltairVal *_fn_data_migrate(AltairVal *prefix, AltairVal *lugar) {
         rename(oldpath,newpath);
     }
     closedir(d);
+    altair_val_free(prefix); altair_val_free(lugar);
     return altair_bool(1);
 }

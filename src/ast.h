@@ -64,6 +64,13 @@ typedef enum {
     ND_CANVAS_GFX,
     ND_LAYOUT,
     ND_KEY_EXPR,
+
+    ND_REG_DECL,
+    ND_REG_READ,
+    ND_REG_WRITE,
+    ND_REG_FREE,
+    ND_POINT,
+    ND_UNPOINT,
 } NodeKind;
 
 typedef enum {
@@ -75,6 +82,7 @@ typedef enum {
     VTYPE_COLOR,
     VTYPE_FILE,
     VTYPE_POINTER,
+    VTYPE_LBA,
 } VType;
 
 #define MAX_CHILDREN  128
@@ -180,6 +188,10 @@ struct ASTNode {
     char      gfx_link_lib[64];
 
     char      persist_file[256];
+
+    char      reg_name[16];
+    int       reg_bits;
+    char      point_var[128];
 };
 
 ASTNode *ast_new(NodeKind kind, int line);

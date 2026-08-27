@@ -189,6 +189,21 @@ static ASTNode *parse_primary(Parser *p){
         expect(p,TOK_RPAREN);
         return n;
     }
+    if(check(p,TOK_LBA)){
+        advance(p);
+        expect(p,TOK_PERCENT_LIT);
+        char word[128]={0};
+        if(is_ident_like(p)){ strncpy(word,p->cur.value,127); advance(p); }
+        expect(p,TOK_LPAREN);
+        ASTNode *n=ast_new(ND_FUNC_CALL,line);
+        char fname[160]; snprintf(fname,159,"lba_%s",word); strncpy(n->fun_name,fname,127);
+        while(!check(p,TOK_RPAREN)&&!check(p,TOK_EOF)){
+            if(n->nchildren>0) expect(p,TOK_COMMA);
+            if(n->nchildren<MAX_CHILDREN) n->children[n->nchildren++]=parse_expr(p);
+        }
+        expect(p,TOK_RPAREN);
+        return n;
+    }
     if(check(p,TOK_LPAREN)){
         advance(p);
         ASTNode *e=parse_expr(p);
@@ -203,6 +218,25 @@ static ASTNode *parse_primary(Parser *p){
         return u;
     }
 
+    if(is_ident_like(p)&&strcmp(p->cur.value,"reg")==0){
+        Lexer save_lex=p->lex; Token save_reg=p->cur;
+        advance(p);
+        if(check(p,TOK_AMP)){
+            advance(p);
+            if(is_ident_like(p)&&strcmp(p->cur.value,"read")==0){
+                advance(p);
+                expect(p,TOK_LPAREN);
+                char rname[16]={0};
+                if(is_ident_like(p)){ strncpy(rname,p->cur.value,15); advance(p); }
+                expect(p,TOK_RPAREN);
+                ASTNode *n=ast_new(ND_REG_READ,line);
+                strncpy(n->reg_name,rname,15);
+                return n;
+            }
+        }
+        p->lex=save_lex; p->cur=save_reg;
+    }
+
     if(is_ident_like(p)&&
        (strcmp(p->cur.value,"system")==0||strcmp(p->cur.value,"compiler")==0||
         strcmp(p->cur.value,"program")==0)){
@@ -214,6 +248,21 @@ static ASTNode *parse_primary(Parser *p){
                 exit(1);
             }
             char key[64]; strncpy(key,p->cur.value,63); advance(p);
+            if(strcmp(ns,"system")==0&&(strcmp(key,"point")==0||strcmp(key,"unpoint")==0)&&
+               check(p,TOK_LPAREN)){
+                advance(p);
+                if(strcmp(key,"point")==0){
+                    ASTNode *n=ast_new(ND_POINT,line);
+                    if(is_ident_like(p)){ strncpy(n->point_var,p->cur.value,127); advance(p); }
+                    expect(p,TOK_RPAREN);
+                    return n;
+                } else {
+                    ASTNode *n=ast_new(ND_UNPOINT,line);
+                    if(n->nchildren<MAX_CHILDREN) n->children[n->nchildren++]=parse_expr(p);
+                    expect(p,TOK_RPAREN);
+                    return n;
+                }
+            }
             ASTNode *n=ast_new(ND_INTROSPECT,line);
             strncpy(n->introspect_ns,ns,31);
             strncpy(n->introspect_key,key,63);
@@ -631,6 +680,51 @@ static ASTNode *parse_ident_led_stmt(Parser *p, char *name, int line){
 
 static ASTNode *parse_stmt(Parser *p){
     int line=p->cur.line;
+
+    if(is_ident_like(p)&&strcmp(p->cur.value,"reg")==0){
+        Lexer save_lex=p->lex; Token save_reg=p->cur;
+        advance(p);
+        if(check(p,TOK_AMP)){
+            advance(p);
+            if(check(p,TOK_NUMBER)){
+                int bits=(int)atof(p->cur.value); advance(p);
+                char rname[16]={0};
+                if(is_ident_like(p)){ strncpy(rname,p->cur.value,15); advance(p); }
+                ASTNode *n=ast_new(ND_REG_DECL,line);
+                n->reg_bits=bits;
+                strncpy(n->reg_name,rname,15);
+                expect(p,TOK_ASSIGN);
+                if(n->nchildren<MAX_CHILDREN) n->children[n->nchildren++]=parse_expr(p);
+                skip_semi(p);
+                return n;
+            }
+            if(is_ident_like(p)&&strcmp(p->cur.value,"write")==0){
+                advance(p);
+                expect(p,TOK_LPAREN);
+                char rname[16]={0};
+                if(is_ident_like(p)){ strncpy(rname,p->cur.value,15); advance(p); }
+                expect(p,TOK_RPAREN);
+                ASTNode *n=ast_new(ND_REG_WRITE,line);
+                strncpy(n->reg_name,rname,15);
+                expect(p,TOK_ASSIGN);
+                if(n->nchildren<MAX_CHILDREN) n->children[n->nchildren++]=parse_expr(p);
+                skip_semi(p);
+                return n;
+            }
+            if(is_ident_like(p)&&strcmp(p->cur.value,"free")==0){
+                advance(p);
+                expect(p,TOK_LPAREN);
+                char rname[16]={0};
+                if(is_ident_like(p)){ strncpy(rname,p->cur.value,15); advance(p); }
+                expect(p,TOK_RPAREN);
+                ASTNode *n=ast_new(ND_REG_FREE,line);
+                strncpy(n->reg_name,rname,15);
+                skip_semi(p);
+                return n;
+            }
+        }
+        p->lex=save_lex; p->cur=save_reg;
+    }
 
     if(is_soft_keyword_kind(p->cur.kind)){
         TokenKind nk;
@@ -1433,6 +1527,37 @@ static ASTNode *parse_stmt(Parser *p){
         if(is_ident_like(p)){ strncpy(vname,p->cur.value,127); advance(p); }
         ASTNode *n=ast_new(ND_VAR_DECL,line);
         n->var_type=VTYPE_POINTER;
+        strncpy(n->var_name,vname,127);
+        strncpy(n->class_name,word,127);
+        n->storage=STOR_AUTO;
+        if(check(p,TOK_ASSIGN)){
+            advance(p);
+            if(n->nchildren<MAX_CHILDREN) n->children[n->nchildren++]=parse_expr(p);
+        }
+        skip_semi(p); return n;
+    }
+    if(check(p,TOK_LBA)){
+        advance(p);
+        expect(p,TOK_PERCENT_LIT);
+        char word[128]={0};
+        if(is_ident_like(p)||check_type(p)){ strncpy(word,p->cur.value,127); advance(p); }
+        if(check(p,TOK_LPAREN)){
+            advance(p);
+            ASTNode *n=ast_new(ND_FUNC_CALL,line);
+            char fname[160]; snprintf(fname,159,"lba_%s",word); strncpy(n->fun_name,fname,127);
+            while(!check(p,TOK_RPAREN)&&!check(p,TOK_EOF)){
+                if(n->nchildren>0) expect(p,TOK_COMMA);
+                if(n->nchildren<MAX_CHILDREN) n->children[n->nchildren++]=parse_expr(p);
+            }
+            expect(p,TOK_RPAREN);
+            ASTNode *s=ast_new(ND_EXPR_STMT,line);
+            s->children[s->nchildren++]=n;
+            skip_semi(p); return s;
+        }
+        char vname[128]={0};
+        if(is_ident_like(p)){ strncpy(vname,p->cur.value,127); advance(p); }
+        ASTNode *n=ast_new(ND_VAR_DECL,line);
+        n->var_type=VTYPE_LBA;
         strncpy(n->var_name,vname,127);
         strncpy(n->class_name,word,127);
         n->storage=STOR_AUTO;

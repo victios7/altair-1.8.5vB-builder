@@ -18,7 +18,8 @@ typedef enum {
     ALT_TOKEN,
     ALT_VOID,
     ALT_FILE,
-    ALT_POINTER
+    ALT_POINTER,
+    ALT_LBA
 } AltVType;
 
 typedef enum {
@@ -34,6 +35,18 @@ typedef struct AltairObj AltairObj;
 
 struct AltairVal {
     AltVType type;
+    /* A2: when num_is_int is set, num_i64 holds the exact integer value
+       produced by the fast (long long) codegen path. num still mirrors
+       it as a double for existing double-based call sites, but display
+       and integer-widening code should prefer num_i64 to avoid losing
+       precision above 2^53. */
+    int        num_is_int;
+    long long  num_i64;
+    /* C2: capacity of str's heap buffer (ALT_TEXT only). 0 means "unknown/
+       exact fit" (e.g. just strdup'd). Lets altair_var_plus_assign grow the
+       buffer with amortized doubling instead of reallocating+copying the
+       whole string on every "+=" in a loop. */
+    size_t     str_cap;
     union {
         double      num;
         char       *str;
@@ -91,7 +104,6 @@ typedef struct {
     int     active;
 } AltairError;
 
-/* Fast Numeric List */
 typedef struct {
     double *items;
     int     len;
@@ -103,7 +115,6 @@ void altair_fnumlist_free(AltairFNumList *list);
 void altair_fnumlist_append(AltairFNumList *list, double value);
 AltairVal *altair_fnumlist_to_val(AltairFNumList *list);
 
-/* String Builder */
 typedef struct {
     char   *buf;
     size_t  len;
@@ -133,6 +144,9 @@ void altair_pause_if_own_console(void);
 #endif
 
 AltairVal *altair_num(double n);
+AltairVal *altair_num_i64(long long n);
+AltairVal *altair_text_append_owned(AltairVal *dst, AltairVal *addend);
+void       altair_var_plus_assign(AltairVar *v, AltairVal *addend, int line);
 AltairVal *altair_str(const char *s);
 AltairVal *altair_str_own(char *s);
 AltairVal *altair_bool(int b);
@@ -158,6 +172,10 @@ void       altair_var_unregister(const char *name);
 AltairVar *altair_var_lookup(const char *name);
 
 void       altair_var_release(AltairVar **vp);
+void       altair_var_release_view(AltairVar **vp);
+
+AltairVal *altair_point(AltairVar *v);
+AltairVal *altair_unpoint(double addr);
 
 void altair_migrate(AltairVar *v, int state_num);
 void altair_migrate_name(AltairVar *v, const char *state_name);
@@ -254,6 +272,20 @@ AltairVal *_fn_p_read(AltairVal *p, AltairVal *offset);
 AltairVal *_fn_p_bytes(AltairVal *p);
 AltairVal *_fn_p_null(AltairVal *p);
 AltairVal *_fn_p_free(AltairVal *p);
+
+/* lba%: same read/write/bytes/null/free shape as p#, but disk-backed via
+   FILE* instead of a malloc'd buffer. dalloc() makes an anonymous node
+   (deleted when freed); dopen() makes a named, persistent node whose file
+   survives past lba_free(). */
+AltairVal *altair_new_lba(void *fp);
+AltairVal *_fn_dalloc(AltairVal *size);
+AltairVal *_fn_dopen(AltairVal *path, AltairVal *size);
+AltairVal *_fn_draw(AltairVal *path);
+AltairVal *_fn_lba_write(AltairVal *p, AltairVal *offset, AltairVal *val);
+AltairVal *_fn_lba_read(AltairVal *p, AltairVal *offset);
+AltairVal *_fn_lba_bytes(AltairVal *p);
+AltairVal *_fn_lba_null(AltairVal *p);
+AltairVal *_fn_lba_free(AltairVal *p);
 AltairVal *_fn_data_migrate(AltairVal *prefix, AltairVal *lugar);
 
 void altair_set_args(int argc, char **argv);

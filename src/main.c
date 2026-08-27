@@ -1,4 +1,7 @@
 
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -137,7 +140,7 @@ static char *read_file(const char *path){
 
 static void print_usage(void){
     fprintf(stderr,
-        "Altair Compiler v1.8\n\n"
+        "Altair Compiler v1.8.5\n\n"
         "Usage:\n"
         "  altairc <source.at> [options]\n"
         "  altairc guide              Write ALTAIR_GUIDE.md to current directory\n"
@@ -262,7 +265,7 @@ int main(int argc, char **argv){
     }
 
     if(strcmp(argv[1],"-v")==0||strcmp(argv[1],"--version")==0){
-        printf("altairc 1.8\n"); return 0;
+        printf("altairc 1.8.5\n"); return 0;
     }
     if(strcmp(argv[1],"-h")==0||strcmp(argv[1],"--help")==0){
         print_usage(); return 0;
@@ -388,7 +391,7 @@ int main(int argc, char **argv){
 
     char gcc_cmd[2048];
     snprintf(gcc_cmd, sizeof(gcc_cmd),
-             "cmd /c \"\"%s\" -O3 -o \"%s\" \"%s\" %s%s -lm -lws2_32%s\"",
+             "cmd /c \"\"%s\" -O3 -flto -fomit-frame-pointer -o \"%s\" \"%s\" %s%s -lm -lws2_32%s\"",
              gcc_bin, output_file, tmp_c,
              res_obj[0] ? res_obj : "",
              uses_raylib ? " -I\"libs\\raylib\\windows\\include\" -L\"libs\\raylib\\windows\\lib\"" : "",
@@ -401,20 +404,20 @@ int main(int argc, char **argv){
     if(uses_raylib){
 #if defined(__APPLE__)
         snprintf(gcc_cmd, sizeof(gcc_cmd),
-                 "%s -O3 -o \"%s\" \"%s\" -I\"libs/raylib/macos/include\" -L\"libs/raylib/macos/lib\""
+                 "%s -O3 -flto -fomit-frame-pointer -o \"%s\" \"%s\" -I\"libs/raylib/macos/include\" -L\"libs/raylib/macos/lib\""
                  " -lm -lpthread -lraylib"
                  " -framework CoreVideo -framework IOKit -framework Cocoa"
                  " -framework GLUT -framework OpenGL 2>&1",
                  gcc_bin, output_file, tmp_c);
 #else
         snprintf(gcc_cmd, sizeof(gcc_cmd),
-                 "%s -O3 -o \"%s\" \"%s\" -I\"libs/raylib/linux/include\" -L\"libs/raylib/linux/lib\""
+                 "%s -O3 -flto -fomit-frame-pointer -o \"%s\" \"%s\" -I\"libs/raylib/linux/include\" -L\"libs/raylib/linux/lib\""
                  " -lm -lpthread -lraylib -lX11 -lXrandr -lXinerama -lXi -lXcursor -lGL -ldl -lrt 2>&1",
                  gcc_bin, output_file, tmp_c);
 #endif
     } else {
         snprintf(gcc_cmd, sizeof(gcc_cmd),
-                 "%s -O3 -o \"%s\" \"%s\" -lm -lpthread 2>&1",
+                 "%s -O3 -flto -fomit-frame-pointer -o \"%s\" \"%s\" -lm -lpthread 2>&1",
                  gcc_bin, output_file, tmp_c);
     }
     ret = system(gcc_cmd);

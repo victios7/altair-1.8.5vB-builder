@@ -2,7 +2,7 @@ Unicode True
 !include "MUI2.nsh"
 
 !define APPNAME    "Altair"
-!define APPVERSION "1.8"
+!define APPVERSION "1.8.5"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Altair"
 
 Name "Altair Language ${APPVERSION}"

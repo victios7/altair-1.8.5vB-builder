@@ -87,7 +87,7 @@ static const struct { const char *word; TokenKind kind; } KEYWORDS[] = {
     {"grid",TOK_GRID},
     {"key",TOK_KEY_KW},
 
-    {"char",TOK_CHAR},{"file",TOK_FILE},{"p",TOK_POINT},{"data",TOK_DATA_KW},
+    {"char",TOK_CHAR},{"file",TOK_FILE},{"p",TOK_POINT},{"lba",TOK_LBA},{"data",TOK_DATA_KW},
 
     {NULL,TOK_EOF}
 };

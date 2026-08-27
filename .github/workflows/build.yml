@@ -120,12 +120,12 @@ jobs:
           cp altairc pkgroot/usr/bin/
           cp -r runtime/* pkgroot/usr/share/altair/runtime/
           cp -r examples/* pkgroot/usr/share/altair/examples/
-          printf 'Package: altair\nVersion: 1.8\nSection: devel\nPriority: optional\nArchitecture: amd64\nMaintainer: victios7\nDescription: Altair compiler\n' > pkgroot/DEBIAN/control
-          dpkg-deb --build pkgroot altair_1.8_amd64.deb
+          printf 'Package: altair\nVersion: 1.8.5\nSection: devel\nPriority: optional\nArchitecture: amd64\nMaintainer: victios7\nDescription: Altair compiler\n' > pkgroot/DEBIAN/control
+          dpkg-deb --build pkgroot altair_1.8.5_amd64.deb
       - uses: actions/upload-artifact@v4
         with:
           name: altair-linux-deb
-          path: altair_1.8_amd64.deb
+          path: altair_1.8.5_amd64.deb
 
   macos-pkg:
     runs-on: macos-latest
@@ -141,11 +141,11 @@ jobs:
           cp altairc pkgroot/usr/local/bin/
           cp -r runtime/* pkgroot/usr/local/share/altair/runtime/
           cp -r examples/* pkgroot/usr/local/share/altair/examples/
-          pkgbuild --root pkgroot --identifier com.victios7.altair --version 1.8 --install-location / altair-1.8.pkg
+          pkgbuild --root pkgroot --identifier com.victios7.altair --version 1.8.5 --install-location / altair-1.8.5.pkg
       - uses: actions/upload-artifact@v4
         with:
           name: altair-macos-pkg
-          path: altair-1.8.pkg
+          path: altair-1.8.5.pkg
 
   release:
     needs: [linux-pkg, macos-zip, windows-exe, linux-deb, macos-pkg]

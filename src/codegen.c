@@ -30,12 +30,17 @@ typedef struct {
     const char *source_file;
 
     char  local_vars[256][128];
+    int   local_is_view[256];
     int   nlocal;
+    char  cur_fast_names[256][128];
+    int   n_cur_fast_names;
     int   in_fun;
     int   scope_mark[64];
     int   scope_depth;
     char  known_funs[128][128];
     int   nknown_funs;
+    char  void_funs[128][128];
+    int   nvoid_funs;
 
     char  cur_fun_params[16][128];
     int   n_cur_fun_params;
@@ -48,6 +53,11 @@ typedef struct {
     int   npersist;
     char  global_vars[256][128];
     int   nglobal_vars;
+    int   block_depth;
+
+    int   fast_append_active;
+    char  fast_append_listname[128];
+    int   fast_append_tmp;
 } CG;
 
 static char *cg_fmt(const char *fmt,...);
@@ -163,7 +173,15 @@ static int is_local_var(CG *g, const char *name){
     return 0;
 }
 static void push_local(CG *g, const char *name){
-    if(g->nlocal<256) strncpy(g->local_vars[g->nlocal++],name,127);
+    if(g->nlocal<256){ g->local_is_view[g->nlocal]=0; strncpy(g->local_vars[g->nlocal++],name,127); }
+}
+static void push_local_view(CG *g, const char *name){
+    if(g->nlocal<256){ g->local_is_view[g->nlocal]=1; strncpy(g->local_vars[g->nlocal++],name,127); }
+}
+static int is_cur_fast_name(CG *g, const char *name){
+    for(int i=0;i<g->n_cur_fast_names;i++)
+        if(strcmp(g->cur_fast_names[i],name)==0) return 1;
+    return 0;
 }
 static void record_var_class(CG *g, const char *var, const char *cls){
     if(g->nvar_class>=256) return;
@@ -204,14 +222,6 @@ static void emitln(CG *g,const char *fmt,...){
     ind(g); va_list ap; va_start(ap,fmt); vfprintf(g->fp,fmt,ap); va_end(ap);
     fprintf(g->fp,"\n");
 }
-/*--------------------------------------------------------------
- * Scopes
- * --------------------------------------------------------------
- * LEGACY_SCOPE   – mantiene el antiguo comportamiento (solo funciona
- *                  dentro de funciones).  
- * ENABLE_SCOPE   – abre un scope para cualquier bloque, lo que
- *                  elimina la fuga de memoria global.
- *--------------------------------------------------------------*/
 #ifndef LEGACY_SCOPE
 #define ENABLE_SCOPE 1
 #endif
@@ -237,7 +247,9 @@ static void global_release_all(CG *g) {
 }
 static void emit_release_open_scopes(CG *g){
     for(int i=g->nlocal-1;i>=0;i--)
-        emitln(g,"altair_var_release(&%s_var);",g->local_vars[i]);
+        emitln(g,"%s(&%s_var);",
+               g->local_is_view[i] ? "altair_var_release_view" : "altair_var_release",
+               g->local_vars[i]);
 }
 static int newtmp(CG *g){ return g->tmp++; }
 static char *cg_int_expr(CG *g, char *e){
@@ -280,10 +292,87 @@ typedef struct {
     char fun_names[64][128];
     ASTNode *fun_nodes[64];
     int  nf;
+    char boxed_names[32][128];
+    VType boxed_types[32];
+    int  boxed_is_param[32];
+    int  nboxed;
 } FastNumCtx;
+
+typedef struct {
+    char fun_name[128];
+    int  nparam;
+    int  borrow_safe[MAX_PARAMS];
+} BorrowInfo;
+static BorrowInfo g_borrow_tbl[128];
+static int g_borrow_n=0;
+
+static int fast_num_boxed_escapes(ASTNode *n, const char *name);
+static void cg_stmt(CG *g, ASTNode *n);
+static const char *vtype_c(VType t);
+
+static char g_pointed_names[64][128];
+static int g_n_pointed_names=0;
+static void collect_pointed_names(ASTNode *n){
+    if(!n) return;
+    if(n->kind==ND_POINT && n->point_var[0] && g_n_pointed_names<64){
+        int dup=0;
+        for(int i=0;i<g_n_pointed_names;i++)
+            if(strcmp(g_pointed_names[i],n->point_var)==0) dup=1;
+        if(!dup) strncpy(g_pointed_names[g_n_pointed_names++],n->point_var,127);
+    }
+    for(int i=0;i<n->nchildren;i++) collect_pointed_names(n->children[i]);
+    collect_pointed_names(n->left); collect_pointed_names(n->right);
+    collect_pointed_names(n->count_expr); collect_pointed_names(n->body);
+    collect_pointed_names(n->fun_body);
+    collect_pointed_names(n->try_body); collect_pointed_names(n->catch_body);
+    collect_pointed_names(n->idx_expr); collect_pointed_names(n->idx_val);
+    collect_pointed_names(n->iter_list_expr);
+}
+static int is_pointed_name(const char *name){
+    for(int i=0;i<g_n_pointed_names;i++)
+        if(strcmp(g_pointed_names[i],name)==0) return 1;
+    return 0;
+}
+
+static void borrow_analyze(ASTNode *program){
+    g_borrow_n=0;
+    ASTNode *body=NULL;
+    for(int i=0;i<program->nchildren;i++)
+        if(program->children[i] && program->children[i]->kind==ND_BLOCK) body=program->children[i];
+    if(!body) return;
+    for(int i=0;i<body->nchildren && g_borrow_n<128;i++){
+        ASTNode *s=body->children[i];
+        if(!s || s->kind!=ND_FUN_DECL) continue;
+        BorrowInfo *bi=&g_borrow_tbl[g_borrow_n++];
+        strncpy(bi->fun_name,s->fun_name,127); bi->fun_name[127]='\0';
+        bi->nparam=s->nparam;
+        for(int p=0;p<s->nparam && p<MAX_PARAMS;p++){
+            VType pt=s->param_types[p];
+            if(pt==VTYPE_LIST||pt==VTYPE_TEXT||pt==VTYPE_OBJECT)
+                bi->borrow_safe[p] = !fast_num_boxed_escapes(s->fun_body, s->param_names[p]);
+            else
+                bi->borrow_safe[p] = 0;
+        }
+    }
+}
+static int param_is_borrow_safe(const char *fun_name, int idx){
+    for(int i=0;i<g_borrow_n;i++)
+        if(strcmp(g_borrow_tbl[i].fun_name,fun_name)==0)
+            return idx>=0 && idx<g_borrow_tbl[i].nparam && g_borrow_tbl[i].borrow_safe[idx];
+    return 0;
+}
 
 static int fast_num_has(const FastNumCtx *ctx, const char *name){
     for(int i=0;i<ctx->n;i++) if(strcmp(ctx->names[i],name)==0) return 1;
+    return 0;
+}
+static int fast_num_boxed_has(const FastNumCtx *ctx, const char *name){
+    for(int i=0;i<ctx->nboxed;i++) if(strcmp(ctx->boxed_names[i],name)==0) return 1;
+    return 0;
+}
+static int fast_num_boxed_is_param(const FastNumCtx *ctx, const char *name){
+    for(int i=0;i<ctx->nboxed;i++)
+        if(strcmp(ctx->boxed_names[i],name)==0) return ctx->boxed_is_param[i];
     return 0;
 }
 static ASTNode *fast_num_fun(const FastNumCtx *ctx, const char *name){
@@ -292,12 +381,60 @@ static ASTNode *fast_num_fun(const FastNumCtx *ctx, const char *name){
     return NULL;
 }
 
+static int is_readonly_numeric_builtin(const char *name){
+    return strcmp(name,"length")==0;
+}
+
+static int fast_num_boxed_escapes(ASTNode *n, const char *name){
+    if(!n) return 0;
+    switch(n->kind){
+    case ND_ASSIGN:
+        if(n->left && n->left->kind==ND_IDENT && strcmp(n->left->str_val,name)==0) return 1;
+        break;
+    case ND_METHOD_CALL:
+        /* B3: append/remove/clear/length only mutate or read through the
+           pointer (same receiver form the codegen already borrows via
+           cg_expr_receiver at the call site) - they don't store the
+           receiver anywhere, so they don't make the parameter escape. */
+        if(n->left && n->left->kind==ND_IDENT && strcmp(n->left->str_val,name)==0 &&
+           !(strcmp(n->fun_name,"append")==0 || strcmp(n->fun_name,"remove")==0 ||
+             strcmp(n->fun_name,"clear")==0  || strcmp(n->fun_name,"length")==0))
+            return 1;
+        break;
+    case ND_RETURN:
+        for(int i=0;i<n->nchildren;i++)
+            if(n->children[i] && n->children[i]->kind==ND_IDENT &&
+               strcmp(n->children[i]->str_val,name)==0) return 1;
+        break;
+    case ND_FUNC_CALL:
+        for(int i=0;i<n->nchildren;i++)
+            if(n->children[i] && n->children[i]->kind==ND_IDENT &&
+               strcmp(n->children[i]->str_val,name)==0 &&
+               !is_readonly_numeric_builtin(n->fun_name)) return 1;
+        break;
+    default: break;
+    }
+    if(fast_num_boxed_escapes(n->left,name)) return 1;
+    if(fast_num_boxed_escapes(n->right,name)) return 1;
+    if(fast_num_boxed_escapes(n->count_expr,name)) return 1;
+    if(fast_num_boxed_escapes(n->body,name)) return 1;
+    for(int i=0;i<n->nchildren;i++)
+        if(fast_num_boxed_escapes(n->children[i],name)) return 1;
+    return 0;
+}
+
 static void fast_num_collect(ASTNode *n, FastNumCtx *ctx){
     if(!n) return;
-    if(n->kind==ND_VAR_DECL && n->var_type==VTYPE_NUMERIC &&
-       (n->storage==STOR_AUTO || n->storage==STOR_RAM) &&
-       ctx->n<256 && !fast_num_has(ctx,n->var_name)){
-        strncpy(ctx->names[ctx->n++],n->var_name,127);
+    if(n->kind==ND_VAR_DECL &&
+       (n->storage==STOR_AUTO || n->storage==STOR_RAM)){
+        if(n->var_type==VTYPE_NUMERIC && ctx->n<256 && !fast_num_has(ctx,n->var_name)){
+            strncpy(ctx->names[ctx->n++],n->var_name,127);
+        } else if((n->var_type==VTYPE_LIST||n->var_type==VTYPE_TEXT||n->var_type==VTYPE_OBJECT)
+                  && ctx->nboxed<32 && !fast_num_boxed_has(ctx,n->var_name)){
+            strncpy(ctx->boxed_names[ctx->nboxed],n->var_name,127);
+            ctx->boxed_types[ctx->nboxed]=n->var_type;
+            ctx->nboxed++;
+        }
     }
     for(int i=0;i<n->nchildren;i++) fast_num_collect(n->children[i],ctx);
     fast_num_collect(n->left,ctx); fast_num_collect(n->right,ctx);
@@ -307,18 +444,32 @@ static void fast_num_collect(ASTNode *n, FastNumCtx *ctx){
 static int fast_num_expr_ok(ASTNode *n, const FastNumCtx *ctx){
     if(!n) return 0;
     switch(n->kind){
-    case ND_NUMBER: return 1;
+    case ND_NUMBER: case ND_BOOL: return 1;
     case ND_IDENT: return fast_num_has(ctx,n->str_val);
     case ND_BINOP:
         return fast_num_expr_ok(n->left,ctx) && fast_num_expr_ok(n->right,ctx);
     case ND_UNOP:
         return fast_num_expr_ok(n->right,ctx);
+    case ND_INDEX_ACCESS:
+        return fast_num_boxed_has(ctx,n->idx_list) &&
+               fast_num_expr_ok(n->idx_expr,ctx);
     case ND_FUNC_CALL: {
+        if(is_readonly_numeric_builtin(n->fun_name) && n->nchildren==1 &&
+           n->children[0]->kind==ND_IDENT &&
+           fast_num_boxed_has(ctx,n->children[0]->str_val))
+            return 1;
         ASTNode *fun=fast_num_fun(ctx,n->fun_name);
         if(!fun) return 0;
         if(fun->nparam!=n->nchildren) return 0;
-        for(int i=0;i<n->nchildren;i++)
-            if(!fast_num_expr_ok(n->children[i],ctx)) return 0;
+        for(int i=0;i<n->nchildren;i++){
+            VType pt=fun->param_types[i];
+            if(pt==VTYPE_NUMERIC || pt==VTYPE_BOOL){
+                if(!fast_num_expr_ok(n->children[i],ctx)) return 0;
+            } else {
+                if(!(n->children[i]->kind==ND_IDENT &&
+                     fast_num_boxed_has(ctx,n->children[i]->str_val))) return 0;
+            }
+        }
         return 1;
     }
     default: return 0;
@@ -334,10 +485,14 @@ static int fast_num_stmt_ok(ASTNode *n, const FastNumCtx *ctx){
     case ND_FUN_DECL:
         return fast_num_fun(ctx,n->fun_name)==n;
     case ND_VAR_DECL:
+        if(n->var_type==VTYPE_LIST || n->var_type==VTYPE_TEXT || n->var_type==VTYPE_OBJECT)
+            return n->storage==STOR_AUTO || n->storage==STOR_RAM;
         return n->var_type==VTYPE_NUMERIC &&
                (n->storage==STOR_AUTO || n->storage==STOR_RAM) &&
                (n->nchildren==0 || fast_num_expr_ok(n->children[0],ctx));
     case ND_ASSIGN:
+        if(n->left && n->left->kind==ND_IDENT && fast_num_boxed_has(ctx,n->left->str_val))
+            return 1;
         return n->left && n->left->kind==ND_IDENT &&
                fast_num_has(ctx,n->left->str_val) &&
                fast_num_expr_ok(n->right,ctx);
@@ -359,12 +514,16 @@ static int fast_num_stmt_ok(ASTNode *n, const FastNumCtx *ctx){
             }
             return !n->has_else || fast_num_stmt_ok(n->children[idx],ctx);
         }
+    case ND_INDEX_ASSIGN:
+        return n->idx_list[0] && fast_num_boxed_has(ctx,n->idx_list) &&
+               fast_num_expr_ok(n->idx_expr,ctx) &&
+               fast_num_expr_ok(n->idx_val,ctx);
     case ND_LOG:
-        return n->nchildren>0 && fast_num_expr_ok(n->children[0],ctx);
+        return n->nchildren>0;
     case ND_RETURN:
         return n->nchildren>0 && fast_num_expr_ok(n->children[0],ctx);
     case ND_EXPR_STMT:
-        return n->nchildren>0 && fast_num_expr_ok(n->children[0],ctx);
+        return n->nchildren>0;
     default:
         return 0;
     }
@@ -372,10 +531,20 @@ static int fast_num_stmt_ok(ASTNode *n, const FastNumCtx *ctx){
 
 static int fast_num_fun_ok(ASTNode *fun, const FastNumCtx *all){
     if(!fun || fun->nparam>16) return 0;
+    if(fun->return_type!=VTYPE_NUMERIC && fun->return_type!=VTYPE_BOOL) return 0;
     FastNumCtx local={0};
     for(int i=0;i<fun->nparam;i++){
-        if(fun->param_types[i]!=VTYPE_NUMERIC) return 0;
-        if(local.n<256) strncpy(local.names[local.n++],fun->param_names[i],127);
+        VType pt=fun->param_types[i];
+        if(pt==VTYPE_NUMERIC || pt==VTYPE_BOOL){
+            if(local.n<256) strncpy(local.names[local.n++],fun->param_names[i],127);
+        } else if((pt==VTYPE_LIST||pt==VTYPE_TEXT||pt==VTYPE_OBJECT) &&
+                  param_is_borrow_safe(fun->fun_name,i)){
+            if(local.nboxed<32){
+                strncpy(local.boxed_names[local.nboxed],fun->param_names[i],127);
+                local.boxed_types[local.nboxed]=pt;
+                local.nboxed++;
+            } else return 0;
+        } else return 0;
     }
     fast_num_collect(fun->fun_body,&local);
     local.nf=all->nf;
@@ -396,8 +565,21 @@ static int fast_num_program_ok(ASTNode *body, FastNumCtx *ctx){
             ctx->fun_nodes[ctx->nf++]=s;
         }
     }
-    for(int i=0;i<ctx->nf;i++) if(!fast_num_fun_ok(ctx->fun_nodes[i],ctx)) return 0;
-    if(ctx->n==0 && ctx->nf==0) return 0;
+    int changed=1;
+    while(changed){
+        changed=0;
+        for(int i=0;i<ctx->nf;i++){
+            if(!fast_num_fun_ok(ctx->fun_nodes[i],ctx)){
+                for(int j=i;j<ctx->nf-1;j++){
+                    strncpy(ctx->fun_names[j],ctx->fun_names[j+1],127);
+                    ctx->fun_nodes[j]=ctx->fun_nodes[j+1];
+                }
+                ctx->nf--;
+                changed=1;
+                i--;
+            }
+        }
+    }
     return fast_num_stmt_ok(body,ctx);
 }
 
@@ -468,7 +650,22 @@ static char *fast_num_name(const char *name){
     return cg_fmt("_alt_fast_%s",name);
 }
 
+/* A1 fix: box a fast-path numeric expression into an AltairVal without
+   routing exact integers through altair_num(double), which silently
+   truncates precision above 2^53. When the program runs in fast-int
+   mode, box via altair_num_i64 so the exact long long is preserved. */
+static char *box_fastnum(const char *expr){
+    return g_fast_int ? cg_fmt("altair_num_i64((long long)(%s))", expr)
+                       : cg_fmt("altair_num((double)(%s))", expr);
+}
+
 static FastNumCtx *fast_num_emit_ctx;
+
+static char *fast_num_boxed_ref(const char *name){
+    if(fast_num_emit_ctx && fast_num_boxed_is_param(fast_num_emit_ctx,name))
+        return cg_fmt("_p_%s",name);
+    return cg_fmt("altair_var_get(%s_var)",name);
+}
 
 static char *fast_num_expr(ASTNode *n){
     if(!n) return strdup(g_fast_int ? "0" : "0.0");
@@ -513,10 +710,31 @@ static char *fast_num_expr(ASTNode *n){
         else out=strdup(g_fast_int ? "0" : "0.0");
         free(l); free(r); return out;
     }
+    case ND_INDEX_ACCESS: {
+        char *ie=fast_num_expr(n->idx_expr);
+        char *br=fast_num_boxed_ref(n->idx_list);
+        char *r=cg_fmt("({ AltairVal *_ixt=altair_list_get(%s,(int)(%s),%d); double _ixr=_ixt?_ixt->num:0; _ixr; })",
+                        br, ie, n->line);
+        free(ie); free(br); return r;
+    }
     case ND_FUNC_CALL: {
+        if(is_readonly_numeric_builtin(n->fun_name) && n->nchildren==1 &&
+           n->children[0]->kind==ND_IDENT){
+            char *br=fast_num_boxed_ref(n->children[0]->str_val);
+            char *r=cg_fmt("({ AltairVal *_lnt=_fn_%s(%s); double _lnr=_lnt->num; altair_val_free(_lnt); _lnr; })",
+                          n->fun_name, br);
+            free(br); return r;
+        }
+        ASTNode *fun=fast_num_fun(fast_num_emit_ctx,n->fun_name);
         char args[2048]="";
         for(int i=0;i<n->nchildren;i++){
-            char *e=fast_num_expr(n->children[i]);
+            VType pt = fun ? fun->param_types[i] : VTYPE_NUMERIC;
+            char *e;
+            if((pt==VTYPE_LIST||pt==VTYPE_TEXT||pt==VTYPE_OBJECT) &&
+               n->children[i]->kind==ND_IDENT)
+                e=fast_num_boxed_ref(n->children[i]->str_val);
+            else
+                e=fast_num_expr(n->children[i]);
             if(i>0) strncat(args,",",sizeof(args)-strlen(args)-1);
             strncat(args,e,sizeof(args)-strlen(args)-1);
             free(e);
@@ -534,12 +752,23 @@ static void fast_num_stmt(CG *g, ASTNode *n){
         for(int i=0;i<n->nchildren;i++) fast_num_stmt(g,n->children[i]);
         break;
     case ND_VAR_DECL: {
+        if(n->var_type==VTYPE_LIST || n->var_type==VTYPE_TEXT || n->var_type==VTYPE_OBJECT ||
+           is_pointed_name(n->var_name)){
+            cg_stmt(g,n);
+            break;
+        }
         char *name=fast_num_name(n->var_name);
         char *e=n->nchildren ? fast_num_expr(n->children[0]) : strdup(g_fast_int ? "0" : "0.0");
         emitln(g,"alt_fastnum_t %s = %s;",name,e);
         free(name); free(e); break;
     }
     case ND_ASSIGN: {
+        if(n->left && n->left->kind==ND_IDENT &&
+           ((fast_num_emit_ctx && fast_num_boxed_has(fast_num_emit_ctx,n->left->str_val)) ||
+            is_pointed_name(n->left->str_val))){
+            cg_stmt(g,n);
+            break;
+        }
         char *name=fast_num_name(n->left->str_val), *e=fast_num_expr(n->right);
         emitln(g,"%s = %s;",name,e);
         free(name); free(e); break;
@@ -583,16 +812,30 @@ static void fast_num_stmt(CG *g, ASTNode *n){
         if(n->has_else){ emitln(g,"} else {"); g->indent++; fast_num_stmt(g,n->children[idx]); g->indent--; }
         emitln(g,"}"); break;
     }
+    case ND_INDEX_ASSIGN:
+        cg_stmt(g,n);
+        break;
     case ND_LOG: {
+        if(!fast_num_expr_ok(n->children[0],fast_num_emit_ctx)){
+            cg_stmt(g,n);
+            break;
+        }
         char *e=fast_num_expr(n->children[0]);
-        emitln(g,"{ AltairVal *_fast_log=altair_num(%s); altair_log(_fast_log); altair_val_free(_fast_log); }",e);
-        free(e); break;
+        char *boxed=box_fastnum(e);
+        emitln(g,"{ AltairVal *_fast_log=%s; altair_log(_fast_log); altair_val_free(_fast_log); }",boxed);
+        free(e); free(boxed); break;
     }
     case ND_RETURN: {
         char *e=fast_num_expr(n->children[0]);
-        emitln(g,"return %s;",e); free(e); break;
+        emitln(g,"alt_fastnum_t _fret=%s;",e); free(e);
+        emit_release_open_scopes(g);
+        emitln(g,"return _fret;"); break;
     }
     case ND_EXPR_STMT: {
+        if(!fast_num_expr_ok(n->children[0],fast_num_emit_ctx)){
+            cg_stmt(g,n);
+            break;
+        }
         char *e=fast_num_expr(n->children[0]);
         emitln(g,"(void)(%s);",e); free(e); break;
     }
@@ -606,13 +849,27 @@ static void fast_num_fun_emit(CG *g, ASTNode *n, FastNumCtx *ctx){
     fprintf(g->fp,"static alt_fastnum_t _alt_fast_fn_%s(",n->fun_name);
     for(int i=0;i<n->nparam;i++){
         if(i>0) fprintf(g->fp,",");
-        fprintf(g->fp,"alt_fastnum_t %s",fast_num_name(n->param_names[i]));
+        VType pt=n->param_types[i];
+        if(pt==VTYPE_LIST||pt==VTYPE_TEXT||pt==VTYPE_OBJECT)
+            fprintf(g->fp,"AltairVal *_p_%s",n->param_names[i]);
+        else
+            fprintf(g->fp,"alt_fastnum_t %s",fast_num_name(n->param_names[i]));
     }
     fprintf(g->fp,"){\n");
     int saved_indent=g->indent;
     g->indent=1;
     FastNumCtx local={0};
-    for(int i=0;i<n->nparam;i++) strncpy(local.names[local.n++],n->param_names[i],127);
+    for(int i=0;i<n->nparam;i++){
+        VType pt=n->param_types[i];
+        if(pt==VTYPE_LIST||pt==VTYPE_TEXT||pt==VTYPE_OBJECT){
+            strncpy(local.boxed_names[local.nboxed],n->param_names[i],127);
+            local.boxed_types[local.nboxed]=pt;
+            local.boxed_is_param[local.nboxed]=1;
+            local.nboxed++;
+        } else {
+            strncpy(local.names[local.n++],n->param_names[i],127);
+        }
+    }
     fast_num_collect(n->fun_body,&local);
     local.nf=ctx->nf;
     for(int i=0;i<ctx->nf;i++){
@@ -621,11 +878,65 @@ static void fast_num_fun_emit(CG *g, ASTNode *n, FastNumCtx *ctx){
     }
     FastNumCtx *saved_ctx=fast_num_emit_ctx;
     fast_num_emit_ctx=&local;
+    int saved_ncfn=g->n_cur_fast_names;
+    char saved_cfn[256][128];
+    memcpy(saved_cfn, g->cur_fast_names, sizeof(saved_cfn));
+    g->n_cur_fast_names=0;
+    for(int i=0;i<local.n && g->n_cur_fast_names<256;i++)
+        if(!is_pointed_name(local.names[i]))
+            strncpy(g->cur_fast_names[g->n_cur_fast_names++],local.names[i],127);
+    int saved_nlocal=g->nlocal; g->nlocal=0;
+    int saved_in_fun=g->in_fun; g->in_fun=1;
+    int saved_scope_depth=g->scope_depth; g->scope_depth=0;
+    int saved_ncfp=g->n_cur_fun_params;
+    char saved_cfp[16][128];
+    memcpy(saved_cfp, g->cur_fun_params, sizeof(saved_cfp));
+    g->n_cur_fun_params=0;
+    for(int i=0;i<n->nparam && g->n_cur_fun_params<16;i++){
+        strncpy(g->cur_fun_params[g->n_cur_fun_params], n->param_names[i], 127);
+        g->n_cur_fun_params++;
+    }
+    for(int i=0;i<n->nparam;i++){
+        VType pt=n->param_types[i];
+        if(pt!=VTYPE_LIST && pt!=VTYPE_TEXT && pt!=VTYPE_OBJECT) continue;
+    }
     fast_num_stmt(g,n->fun_body);
+    emit_release_open_scopes(g);
+    g->nlocal=saved_nlocal;
+    g->in_fun=saved_in_fun;
+    g->scope_depth=saved_scope_depth;
+    g->n_cur_fun_params=saved_ncfp;
+    memcpy(g->cur_fun_params, saved_cfp, sizeof(saved_cfp));
+    g->n_cur_fast_names=saved_ncfn;
+    memcpy(g->cur_fast_names, saved_cfn, sizeof(saved_cfn));
     fast_num_emit_ctx=saved_ctx;
     emitln(g,"return 0;");
     g->indent=saved_indent;
     fprintf(g->fp,"}\n\n");
+}
+static void fast_num_fun_emit_bridge(CG *g, ASTNode *n){
+    fprintf(g->fp,"AltairVal * _fn_%s(",n->fun_name);
+    for(int i=0;i<n->nparam;i++){
+        if(i>0) fprintf(g->fp,",");
+        fprintf(g->fp,"AltairVal *_p_%s",n->param_names[i]);
+    }
+    fprintf(g->fp,"){\n");
+    for(int i=0;i<n->nparam;i++){
+        VType pt=n->param_types[i];
+        if(pt==VTYPE_LIST||pt==VTYPE_TEXT||pt==VTYPE_OBJECT) continue;
+        fprintf(g->fp,"    alt_fastnum_t _bn_%s=_p_%s?(_p_%s->num_is_int?(alt_fastnum_t)_p_%s->num_i64:(alt_fastnum_t)_p_%s->num):0; altair_val_free(_p_%s);\n",
+                n->param_names[i],n->param_names[i],n->param_names[i],n->param_names[i],n->param_names[i],n->param_names[i]);
+    }
+    fprintf(g->fp,"    return %s(_alt_fast_fn_%s(",g_fast_int?"altair_num_i64":"altair_num",n->fun_name);
+    for(int i=0;i<n->nparam;i++){
+        if(i>0) fprintf(g->fp,",");
+        VType pt=n->param_types[i];
+        if(pt==VTYPE_LIST||pt==VTYPE_TEXT||pt==VTYPE_OBJECT)
+            fprintf(g->fp,"_p_%s",n->param_names[i]);
+        else
+            fprintf(g->fp,"_bn_%s",n->param_names[i]);
+    }
+    fprintf(g->fp,"));\n}\n\n");
 }
 static int is_known_class(CG *g,const char *name){
     for(int i=0;i<g->nknown;i++) if(strcmp(g->known_classes[i],name)==0) return 1;
@@ -633,6 +944,25 @@ static int is_known_class(CG *g,const char *name){
 }
 static int is_known_fun(CG *g,const char *name){
     for(int i=0;i<g->nknown_funs;i++) if(strcmp(g->known_funs[i],name)==0) return 1;
+    return 0;
+}
+static int is_void_fun(CG *g,const char *name){
+    for(int i=0;i<g->nvoid_funs;i++) if(strcmp(g->void_funs[i],name)==0) return 1;
+    return 0;
+}
+/* D-layer: does this function body contain any "return <expr>" anywhere
+   (nested in if/while/blocks included)? If not, every call to it falls
+   through to the D1 epilogue and always yields NULL - discarding its
+   result at a call site never needs a box+free, just the bare call. */
+static int fun_has_value_return(ASTNode *n){
+    if(!n) return 0;
+    if(n->kind==ND_RETURN && n->nchildren>0) return 1;
+    if(n->kind==ND_FUN_DECL || n->kind==ND_CLASS_DECL) return 0; /* nested/other function, not this one's control flow */
+    if(fun_has_value_return(n->left)) return 1;
+    if(fun_has_value_return(n->right)) return 1;
+    if(fun_has_value_return(n->count_expr)) return 1;
+    if(fun_has_value_return(n->body)) return 1;
+    for(int i=0;i<n->nchildren;i++) if(fun_has_value_return(n->children[i])) return 1;
     return 0;
 }
 static int is_field(CG *g,const char *name){
@@ -664,6 +994,7 @@ static const char *vtype_c(VType t){
     case VTYPE_BOOL:return "ALT_BOOL";       case VTYPE_LIST:return "ALT_LIST";
     case VTYPE_OBJECT:return "ALT_OBJECT";   case VTYPE_TOKEN:return "ALT_TOKEN";
     case VTYPE_FILE:return "ALT_FILE";       case VTYPE_POINTER:return "ALT_POINTER";
+    case VTYPE_LBA: return "ALT_LBA";
     default:return "ALT_VOID";
     }
 }
@@ -690,9 +1021,33 @@ static char *c_escape(const char *s){
 }
 
 static char *cg_expr(CG *g, ASTNode *n);
+static char *cg_var_container_expr(CG *g, const char *name){
+    if(g->in_fun && !is_local_var(g,name) && !is_catch_id(g,name))
+        return cg_fmt("altair_var_lookup(\"%s\")", name);
+    return cg_fmt("%s_var", name);
+}
+static const char *reg_ctype(int bits){
+    if(bits==64) return "uint64_t";
+    if(bits==32) return "uint32_t";
+    if(bits==16) return "uint16_t";
+    return "uint8_t";
+}
+static int cg_reg_bits_of(const char *name){
+    if(!strcmp(name,"rbx")||!strcmp(name,"r12")||!strcmp(name,"r13")||!strcmp(name,"r14")) return 64;
+    if(!strcmp(name,"ebx")||!strcmp(name,"r12d")||!strcmp(name,"r13d")||!strcmp(name,"r14d")) return 32;
+    if(!strcmp(name,"bx")||!strcmp(name,"r12w")||!strcmp(name,"r13w")||!strcmp(name,"r14w")) return 16;
+    if(!strcmp(name,"bl")||!strcmp(name,"r12b")||!strcmp(name,"r13b")||!strcmp(name,"r14b")) return 8;
+    return 64;
+}
 static char *cg_expr_receiver(CG *g, ASTNode *n){
     if(n && n->kind==ND_IDENT){
         const char *name=n->str_val;
+        if(is_cur_fast_name(g,name)){
+            char *raw=cg_fmt("_alt_fast_%s", name);
+            char *boxed=box_fastnum(raw);
+            free(raw);
+            return boxed;
+        }
         if(g->in_method && is_field(g,name))
             return cg_fmt("altair_obj_get(_self,\"%s\",%d)", name, n->line);
         if(is_token_var(g,name))
@@ -728,6 +1083,13 @@ static char *cg_expr(CG *g, ASTNode *n){
     case ND_IDENT: {
         const char *name=n->str_val;
 
+        if(is_cur_fast_name(g,name)){
+            char *raw=cg_fmt("_alt_fast_%s", name);
+            char *boxed=box_fastnum(raw);
+            free(raw);
+            return boxed;
+        }
+
         if(g->in_method && is_field(g,name))
             return cg_fmt("altair_val_copy(altair_obj_get(_self,\"%s\",%d))", name, n->line);
 
@@ -738,6 +1100,25 @@ static char *cg_expr(CG *g, ASTNode *n){
             return cg_fmt("altair_val_copy(altair_var_get(altair_var_lookup(\"%s\")))", name);
         }
         return cg_fmt("altair_val_copy(altair_var_get(%s_var))", name);
+    }
+
+    case ND_REG_READ:
+        return cg_fmt("altair_num_i64((long long)reg_%s)", n->reg_name);
+
+    case ND_POINT: {
+        char *v = cg_var_container_expr(g,n->point_var);
+        char *r = cg_fmt("altair_point(%s)", v);
+        free(v);
+        return r;
+    }
+
+    case ND_UNPOINT: {
+        char *e = n->nchildren>0 ? cg_expr(g,n->children[0]) : strdup("altair_num(0)");
+        int t = newtmp(g);
+        char *r = cg_fmt("({ AltairVal *_up%d=%s; AltairVal *_upr%d=altair_unpoint(_up%d?_up%d->num:0); altair_val_free(_up%d); _upr%d; })",
+                          t,e,t,t,t,t,t);
+        free(e);
+        return r;
     }
 
     case ND_BINOP: {
@@ -792,9 +1173,10 @@ static char *cg_expr(CG *g, ASTNode *n){
             for(int i=0;i<n->nchildren;i++){
                 emitln(g,"altair_fnumlist_append(_flist%d, %.17g);",t,n->children[i]->num_val);
             }
-            char *result = cg_fmt("altair_fnumlist_to_val(_flist%d)",t);
+            int r=newtmp(g);
+            emitln(g,"AltairVal *_flval%d = altair_fnumlist_to_val(_flist%d);",r,t);
             emitln(g,"altair_fnumlist_free(_flist%d);",t);
-            return result;
+            return cg_fmt("_flval%d",r);
         } else {
             int t=newtmp(g);
             emitln(g,"AltairVal *_lst%d = altair_list_new();",t);
@@ -812,13 +1194,18 @@ static char *cg_expr(CG *g, ASTNode *n){
             return cg_fmt("altair_val_from_obj(_class_%s_new())", n->fun_name);
         }
         int ptr_mutating = strcmp(n->fun_name,"p_free")==0 || strcmp(n->fun_name,"p_write")==0
+            || strcmp(n->fun_name,"lba_free")==0 || strcmp(n->fun_name,"lba_write")==0
             || strcmp(n->fun_name,"close")==0
             || strcmp(n->fun_name,"read")==0
             || strcmp(n->fun_name,"read_line")==0
             || strcmp(n->fun_name,"write")==0;
+        int readonly_ref = strcmp(n->fun_name,"length")==0;
         char args[2048]="";
         for(int i=0;i<n->nchildren;i++){
-            char *e = (ptr_mutating && i==0) ? cg_expr_receiver(g,n->children[i]) : cg_expr(g,n->children[i]);
+            char *e = (ptr_mutating && i==0) ? cg_expr_receiver(g,n->children[i])
+                    : (readonly_ref && i==0)  ? cg_expr_receiver(g,n->children[i])
+                    : param_is_borrow_safe(n->fun_name,i) ? cg_expr_receiver(g,n->children[i])
+                    : cg_expr(g,n->children[i]);
             if(i>0) strncat(args,",",sizeof(args)-strlen(args)-1);
             strncat(args,e,sizeof(args)-strlen(args)-1);
             free(e);
@@ -835,7 +1222,8 @@ static char *cg_expr(CG *g, ASTNode *n){
         int mutating = strcmp(n->fun_name,"append")==0 ||
                        strcmp(n->fun_name,"remove")==0 ||
                        strcmp(n->fun_name,"clear")==0;
-        char *obj = mutating ? cg_expr_receiver(g,n->left) : cg_expr(g,n->left);
+        int readonly_ref = strcmp(n->fun_name,"length")==0;
+        char *obj = (mutating||readonly_ref) ? cg_expr_receiver(g,n->left) : cg_expr(g,n->left);
         char args[2048]="";
         for(int i=0;i<n->nchildren;i++){
             char *e=cg_expr(g,n->children[i]);
@@ -845,6 +1233,15 @@ static char *cg_expr(CG *g, ASTNode *n){
         }
         if(strcmp(n->fun_name,"append")==0){
             char *r;
+            if(g->fast_append_active && n->nchildren==1 &&
+               n->left && n->left->kind==ND_IDENT &&
+               strcmp(n->left->str_val,g->fast_append_listname)==0){
+                int t=newtmp(g);
+                r=cg_fmt("({ AltairVal *_fai%d=%s; altair_fnumlist_append(_flistapp%d,_fai%d->num); "
+                         "altair_val_free(_fai%d); (AltairVal*)NULL; })",
+                         t,args,g->fast_append_tmp,t,t);
+                free(obj); return r;
+            }
             if(n->nchildren==1)
                 r=cg_fmt("({ AltairVal *_ai=%s; altair_list_append(%s,_ai); altair_val_free(_ai); (AltairVal*)NULL; })",args,obj);
             else
@@ -897,10 +1294,11 @@ static char *cg_expr(CG *g, ASTNode *n){
             cls = lookup_var_class(g, n->left->str_val);
         char *r;
         if(cls){
-            r=cg_fmt("_class_%s_method_%s((%s)->type==ALT_OBJECT?(%s)->obj:NULL%s%s)",
-                     cls, n->fun_name, obj, obj, args[0]?",":"", args);
+            int t=newtmp(g);
+            r=cg_fmt("({ AltairVal *_mc%d=%s; _class_%s_method_%s(_mc%d->type==ALT_OBJECT?_mc%d->obj:NULL%s%s); })",
+                     t, obj, cls, n->fun_name, t, t, args[0]?",":"", args);
         } else {
-            r=cg_fmt("((void)0 /* unknown class method %s */,(AltairVal*)NULL)",n->fun_name);
+            r=cg_fmt("((void)0,(AltairVal*)NULL)",n->fun_name);
         }
         free(obj); return r;
     }
@@ -967,10 +1365,180 @@ static char *cg_expr(CG *g, ASTNode *n){
     }
 }
 
+static int node_refs_ident(ASTNode *n, const char *name){
+    if(!n) return 0;
+    if(n->kind==ND_IDENT && strcmp(n->str_val,name)==0) return 1;
+    if(n->kind==ND_INDEX_ACCESS && strcmp(n->idx_list,name)==0) return 1;
+    if((n->kind==ND_COMPOUND_ASSIGN||n->kind==ND_VAR_DECL) &&
+       n->var_name[0] && strcmp(n->var_name,name)==0) return 1;
+    if(n->idx_list[0] && strcmp(n->idx_list,name)==0) return 1;
+    if(n->iter_var[0] && strcmp(n->iter_var,name)==0) return 1;
+    if(node_refs_ident(n->left,name)) return 1;
+    if(node_refs_ident(n->right,name)) return 1;
+    if(node_refs_ident(n->count_expr,name)) return 1;
+    if(node_refs_ident(n->body,name)) return 1;
+    if(node_refs_ident(n->iter_list_expr,name)) return 1;
+    if(node_refs_ident(n->try_body,name)) return 1;
+    if(node_refs_ident(n->catch_body,name)) return 1;
+    if(node_refs_ident(n->idx_expr,name)) return 1;
+    if(node_refs_ident(n->idx_val,name)) return 1;
+    for(int i=0;i<n->nchildren;i++) if(node_refs_ident(n->children[i],name)) return 1;
+    for(int i=0;i<n->ngfx_props;i++) if(node_refs_ident(n->gfx_vals[i],name)) return 1;
+    return 0;
+}
+
+static int fast_append_arg_ok(ASTNode *n, const FastNumCtx *ctx){
+    if(!n) return 0;
+    switch(n->kind){
+    case ND_NUMBER: return 1;
+    case ND_IDENT: return fast_num_has(ctx,n->str_val);
+    case ND_BINOP:
+        switch(n->op){
+        case TOK_PLUS: case TOK_MINUS: case TOK_STAR: case TOK_SLASH:
+        case TOK_PERCENT: case TOK_PERCENT_LIT:
+        case TOK_AMP: case TOK_PIPE: case TOK_CARET: case TOK_SHL: case TOK_SHR:
+            return fast_append_arg_ok(n->left,ctx) && fast_append_arg_ok(n->right,ctx);
+        default: return 0;
+        }
+    case ND_UNOP:
+        if(n->op==TOK_BANG) return 0;
+        return fast_append_arg_ok(n->right,ctx);
+    default: return 0;
+    }
+}
+
+static int fast_append_validate(ASTNode *n, const char *listname,
+                                 const FastNumCtx *ctx, int *count){
+    if(!n) return 1;
+    switch(n->kind){
+    case ND_BLOCK:
+        for(int i=0;i<n->nchildren;i++)
+            if(!fast_append_validate(n->children[i],listname,ctx,count)) return 0;
+        return 1;
+    case ND_EXPR_STMT: {
+        ASTNode *e = n->nchildren>0 ? n->children[0] : NULL;
+        if(e && e->kind==ND_METHOD_CALL && e->left && e->left->kind==ND_IDENT &&
+           strcmp(e->left->str_val,listname)==0 && strcmp(e->fun_name,"append")==0 &&
+           e->nchildren==1){
+            if(!fast_append_arg_ok(e->children[0],ctx)) return 0;
+            (*count)++;
+            return 1;
+        }
+        return e ? !node_refs_ident(e,listname) : 1;
+    }
+    case ND_ASSIGN:
+        return !node_refs_ident(n->left,listname) && !node_refs_ident(n->right,listname);
+    case ND_COMPOUND_ASSIGN:
+        if(n->var_name[0] && strcmp(n->var_name,listname)==0) return 0;
+        return !node_refs_ident(n->right,listname);
+    case ND_IF: {
+        if(node_refs_ident(n->children[0],listname)) return 0;
+        if(!fast_append_validate(n->children[1],listname,ctx,count)) return 0;
+        int idx=2;
+        for(int i=0;i<n->nelif;i++){
+            if(node_refs_ident(n->children[idx],listname)) return 0;
+            if(!fast_append_validate(n->children[idx+1],listname,ctx,count)) return 0;
+            idx+=2;
+        }
+        if(n->has_else) return fast_append_validate(n->children[idx],listname,ctx,count);
+        return 1;
+    }
+    case ND_LOG:
+        for(int i=0;i<n->nchildren;i++) if(node_refs_ident(n->children[i],listname)) return 0;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int is_empty_list_decl(ASTNode *n){
+    return n && n->kind==ND_VAR_DECL && n->var_type==VTYPE_LIST &&
+           (n->storage==STOR_AUTO || n->storage==STOR_RAM) && !n->is_const &&
+           n->persist_file[0]==0 &&
+           n->nchildren==1 && n->children[0]->kind==ND_LIST_LIT &&
+           n->children[0]->nchildren==0;
+}
+
+static void cg_stmt(CG *g, ASTNode *n);
+
+static int try_fast_append_loop(CG *g, ASTNode *blk, int idx){
+    ASTNode *decl=blk->children[idx];
+    if(!is_empty_list_decl(decl)) return 0;
+    const char *vname=decl->var_name;
+
+    int loop_idx=-1;
+    for(int j=idx+1;j<blk->nchildren;j++){
+        ASTNode *s=blk->children[j];
+        if(!s) return 0;
+        if(s->kind==ND_REPEAT || s->kind==ND_WHILE){ loop_idx=j; break; }
+        if(s->kind==ND_CLASS_DECL||s->kind==ND_FUN_DECL||s->kind==ND_ROUTE||
+           s->kind==ND_MIDDLEWARE||s->kind==ND_JOB||s->kind==ND_ON_SHUTDOWN||
+           s->kind==ND_LINK) return 0;
+        if(node_refs_ident(s,vname)) return 0;
+    }
+    if(loop_idx<0) return 0;
+    ASTNode *loopn=blk->children[loop_idx];
+    if(node_refs_ident(loopn->count_expr,vname)) return 0;
+
+    FastNumCtx ctx={0};
+    for(int i=0;i<loop_idx;i++){
+        ASTNode *s=blk->children[i];
+        if(s && s->kind==ND_VAR_DECL && s->var_type==VTYPE_NUMERIC &&
+           (s->storage==STOR_AUTO || s->storage==STOR_RAM) &&
+           ctx.n<256 && !fast_num_has(&ctx,s->var_name)){
+            strncpy(ctx.names[ctx.n++],s->var_name,127);
+        }
+    }
+
+    int count=0;
+    if(!fast_append_validate(loopn->body,vname,&ctx,&count)) return 0;
+    if(count<1) return 0;
+
+    const char *vt=vtype_c(decl->var_type);
+    if(g->in_fun==0 && g->block_depth==0 && g->nglobal_vars<256){
+        strncpy(g->global_vars[g->nglobal_vars++], vname, 127);
+    }
+    if(g->in_fun) push_local(g, vname);
+    emitln(g,"AltairVar *%s_var = altair_var_new(\"%s\",%s,%s,%d,%d,%.1f);",
+           vname,vname,vt,stor_c(decl->storage),decl->is_const,decl->weight,decl->expire_secs);
+
+    for(int i=idx+1;i<loop_idx;i++) cg_stmt(g,blk->children[i]);
+
+    int t=newtmp(g);
+    emitln(g,"AltairFNumList *_flistapp%d = altair_fnumlist_new();",t);
+
+    int saved_active=g->fast_append_active;
+    char saved_name[128]; strncpy(saved_name,g->fast_append_listname,127);
+    int saved_tmp=g->fast_append_tmp;
+    g->fast_append_active=1;
+    strncpy(g->fast_append_listname,vname,127);
+    g->fast_append_tmp=t;
+
+    cg_stmt(g,loopn);
+
+    g->fast_append_active=saved_active;
+    strncpy(g->fast_append_listname,saved_name,127);
+    g->fast_append_tmp=saved_tmp;
+
+    emitln(g,"altair_var_set_own(%s_var, altair_fnumlist_to_val(_flistapp%d));",vname,t);
+    emitln(g,"altair_fnumlist_free(_flistapp%d);",t);
+    return loop_idx-idx+1;
+}
+
 static void cg_block(CG *g, ASTNode *blk){
+
     if(!blk) return;
     if(g->in_fun) scope_push(g);
-    for(int i=0;i<blk->nchildren;i++) cg_stmt(g,blk->children[i]);
+    g->block_depth++;
+    for(int i=0;i<blk->nchildren;i++){
+        int consumed = is_empty_list_decl(blk->children[i]) ? try_fast_append_loop(g,blk,i) : 0;
+        if(consumed>0){
+            i += consumed-1;
+            continue;
+        }
+        cg_stmt(g,blk->children[i]);
+    }
+    g->block_depth--;
     if(g->in_fun) scope_pop_release(g);
 }
 
@@ -987,7 +1555,7 @@ static void cg_stmt(CG *g, ASTNode *n){
         const char *vt=vtype_c(n->var_type);
         int is_const=n->is_const;
         double esecs=n->expire_secs;
-        if (g->in_fun == 0 && g->nglobal_vars < 256) {
+        if (g->in_fun == 0 && g->block_depth == 0 && g->nglobal_vars < 256) {
             strncpy(g->global_vars[g->nglobal_vars++], vname, 127);
         }
         int wt=n->weight;
@@ -1061,6 +1629,29 @@ static void cg_stmt(CG *g, ASTNode *n){
         break;
     }
 
+        case ND_REG_DECL: {
+        char *e = n->nchildren>0 ? cg_expr(g,n->children[0]) : strdup("altair_num(0)");
+        int t = newtmp(g);
+        emitln(g,"AltairVal *_rv%d=%s;",t,e);
+        emitln(g,"register %s reg_%s asm(\"%s\") = (%s)(_rv%d?_rv%d->num:0);",reg_ctype(n->reg_bits),n->reg_name,n->reg_name,reg_ctype(n->reg_bits),t,t);
+        emitln(g,"altair_val_free(_rv%d);",t);
+        free(e);
+        break;
+    }
+    case ND_REG_WRITE: {
+        char *e = n->nchildren>0 ? cg_expr(g,n->children[0]) : strdup("altair_num(0)");
+        int t = newtmp(g);
+        int bits = cg_reg_bits_of(n->reg_name);
+        emitln(g,"AltairVal *_rv%d=%s;",t,e);
+        emitln(g,"reg_%s = (%s)(_rv%d?_rv%d->num:0);",n->reg_name,reg_ctype(bits),t,t);
+        emitln(g,"altair_val_free(_rv%d);",t);
+        free(e);
+        break;
+    }
+
+    case ND_REG_FREE:
+        break;
+
     case ND_ASSIGN: {
         if(n->left && n->left->kind==ND_IDENT){
             const char *vname=n->left->str_val;
@@ -1124,8 +1715,10 @@ static void cg_stmt(CG *g, ASTNode *n){
             emitln(g,"{ AltairVar *_gcv%d=altair_var_lookup(\"%s\");",t,vname);
             g->indent++;
             switch(n->compound_op){
-            case TOK_PLUS_ASSIGN:
-                emitln(g,"if(_gcv%d) altair_var_set_own(_gcv%d,altair_add(altair_var_get(_gcv%d),%s,%d));",t,t,t,rhs,n->line); break;
+            case TOK_PLUS_ASSIGN: {
+                emitln(g,"altair_var_plus_assign(_gcv%d, %s, %d);",t,rhs,n->line);
+                break;
+            }
             case TOK_MINUS_ASSIGN:
                 emitln(g,"if(_gcv%d) altair_var_set_own(_gcv%d,altair_sub(altair_var_get(_gcv%d),%s,%d));",t,t,t,rhs,n->line); break;
             case TOK_STAR_ASSIGN:
@@ -1139,8 +1732,10 @@ static void cg_stmt(CG *g, ASTNode *n){
             emitln(g,"}");
         } else {
             switch(n->compound_op){
-            case TOK_PLUS_ASSIGN:
-                emitln(g,"altair_var_set_own(%s_var, altair_add(altair_var_get(%s_var),%s,%d));",vname,vname,rhs,n->line); break;
+            case TOK_PLUS_ASSIGN: {
+                emitln(g,"altair_var_plus_assign(%s_var, %s, %d);",vname,rhs,n->line);
+                break;
+            }
             case TOK_MINUS_ASSIGN:
                 emitln(g,"altair_var_set_own(%s_var, altair_sub(altair_var_get(%s_var),%s,%d));",vname,vname,rhs,n->line); break;
             case TOK_STAR_ASSIGN:
@@ -1460,8 +2055,19 @@ static void cg_stmt(CG *g, ASTNode *n){
             if(inner->kind==ND_IDENT && is_known_fun(g,inner->str_val) &&
                !(g->in_method && is_field(g,inner->str_val)) &&
                !is_local_var(g,inner->str_val)){
-                emitln(g,"{ AltairVal *_es%d=_fn_%s(); altair_val_free(_es%d); }",
-                       g->tmp,inner->str_val,g->tmp); g->tmp++;
+                if(is_void_fun(g,inner->str_val)){
+                    emitln(g,"_fn_%s();",inner->str_val);
+                } else {
+                    emitln(g,"{ AltairVal *_es%d=_fn_%s(); altair_val_free(_es%d); }",
+                           g->tmp,inner->str_val,g->tmp); g->tmp++;
+                }
+                break;
+            }
+            if(inner->kind==ND_FUNC_CALL && is_void_fun(g,inner->fun_name) &&
+               !(g->in_method && is_field(g,inner->fun_name))){
+                char *e=cg_expr(g,n->children[0]);
+                emitln(g,"(void)(%s);",e);
+                free(e);
                 break;
             }
             char *e=cg_expr(g,n->children[0]);
@@ -1998,7 +2604,7 @@ static void cg_class(CG *g, ASTNode *n){
         for(int pi=0;pi<mth->nparam;pi++){
             emitln(g,"AltairVar *%s_var=altair_var_new(\"%s\",%s,ALT_RAM,0,0,0.0);",
                    mth->param_names[pi],mth->param_names[pi],vtype_c(mth->param_types[pi]));
-            emitln(g,"altair_var_set(%s_var,_p_%s);",mth->param_names[pi],mth->param_names[pi]);
+            emitln(g,"altair_var_set_own(%s_var,_p_%s);",mth->param_names[pi],mth->param_names[pi]);
             push_local(g, mth->param_names[pi]);
             if(g->n_cur_fun_params<16){
                 strncpy(g->cur_fun_params[g->n_cur_fun_params], mth->param_names[pi], 127);
@@ -2044,8 +2650,13 @@ static void cg_fun(CG *g, ASTNode *n){
     for(int i=0;i<n->nparam;i++){
         emitln(g,"AltairVar *%s_var=altair_var_new(\"%s\",%s,ALT_RAM,0,0,0.0);",
                n->param_names[i],n->param_names[i],vtype_c(n->param_types[i]));
-        emitln(g,"altair_var_set(%s_var,_p_%s);",n->param_names[i],n->param_names[i]);
-        push_local(g, n->param_names[i]);
+        if(param_is_borrow_safe(n->fun_name,i)){
+            emitln(g,"%s_var->val=_p_%s;",n->param_names[i],n->param_names[i]);
+            push_local_view(g, n->param_names[i]);
+        } else {
+            emitln(g,"altair_var_set_own(%s_var,_p_%s);",n->param_names[i],n->param_names[i]);
+            push_local(g, n->param_names[i]);
+        }
         if(g->n_cur_fun_params<16){
             strncpy(g->cur_fun_params[g->n_cur_fun_params], n->param_names[i], 127);
             g->n_cur_fun_params++;
@@ -2054,8 +2665,15 @@ static void cg_fun(CG *g, ASTNode *n){
     cg_block(g,n->fun_body);
 
     for(int i=0;i<n->nparam;i++)
-        emitln(g,"altair_var_release(&%s_var);",n->param_names[i]);
-    emitln(g,"return altair_num(0.0);");
+        emitln(g,"%s(&%s_var);",
+               param_is_borrow_safe(n->fun_name,i) ? "altair_var_release_view" : "altair_var_release",
+               n->param_names[i]);
+    /* D1: a function that falls off the end without an explicit return has
+       no meaningful value - same case as a bare "return" (line ~1909),
+       which already yields NULL. Matching that here avoids allocating a
+       throwaway altair_num(0.0) on every call to a void-style function,
+       most of which are immediately discarded by the caller anyway. */
+    emitln(g,"return NULL;");
     g->in_fun=saved_in_fun; g->nlocal=saved_nlocal; g->scope_depth=saved_scope_depth;
     g->n_cur_fun_params=saved_ncfp;
     memcpy(g->cur_fun_params, saved_cfp, sizeof(saved_cfp));
@@ -2067,6 +2685,9 @@ void codegen_emit(ASTNode *program, FILE *fp,
                   const char *runtime_h_path, const char *runtime_c_path,
                   const char *source_file){
     CG g={0}; g.fp=fp; g.indent=0; g.tmp=0; g.source_file=source_file;
+    borrow_analyze(program);
+    g_n_pointed_names=0;
+    collect_pointed_names(program);
 
     ASTNode *body_pre=NULL;
     for(int i=0;i<program->nchildren;i++){
@@ -2086,6 +2707,9 @@ void codegen_emit(ASTNode *program, FILE *fp,
     }
 
     fprintf(fp,"/* ===== Altair Runtime (embebido) ===== */\n");
+    fprintf(fp,"#ifdef __linux__\n");
+    fprintf(fp,"#define _GNU_SOURCE\n");   /* needed for O_DIRECT (draw(), raw LBA) - must precede any system header */
+    fprintf(fp,"#endif\n");
     fprintf(fp,"#define _POSIX_C_SOURCE 200809L\n");
     fprintf(fp,"#ifndef _WIN32\n");
     fprintf(fp,"#include <pthread.h>\n");
@@ -2106,7 +2730,7 @@ void codegen_emit(ASTNode *program, FILE *fp,
     fprintf(fp,"\n/* ===== End of Runtime ===== */\n\n");
 
     if(g.use_raylib){
-        fprintf(fp,"/* ===== Raylib (v1.8 graphics) ===== */\n");
+        fprintf(fp,"/* ===== Raylib (v1.8.5 graphics) ===== */\n");
         fprintf(fp,"#include \"raylib.h\"\n\n");
     }
 
@@ -2134,14 +2758,17 @@ void codegen_emit(ASTNode *program, FILE *fp,
             if(!s) continue;
             if(s->kind==ND_CLASS_DECL && g.nknown<64)
                 strncpy(g.known_classes[g.nknown++],s->class_name,127);
-            if(s->kind==ND_FUN_DECL && g.nknown_funs<128)
+            if(s->kind==ND_FUN_DECL && g.nknown_funs<128){
                 strncpy(g.known_funs[g.nknown_funs++],s->fun_name,127);
+                if(g.nvoid_funs<128 && !fun_has_value_return(s->fun_body))
+                    strncpy(g.void_funs[g.nvoid_funs++],s->fun_name,127);
+            }
         }
     }
     FastNumCtx fast_ctx={0};
     int fast_numeric=fast_num_program_ok(body,&fast_ctx);
-    g_fast_int = fast_numeric && fast_int_program_ok(body,&fast_ctx);
-    if(fast_numeric){
+    g_fast_int = (fast_numeric||fast_ctx.nf>0) && fast_int_program_ok(body,&fast_ctx);
+    if(fast_numeric || fast_ctx.nf>0){
         fprintf(fp,"typedef %s alt_fastnum_t;\n", g_fast_int ? "long long" : "double");
     }
 
@@ -2163,22 +2790,26 @@ void codegen_emit(ASTNode *program, FILE *fp,
                 }
             }
             if(s->kind==ND_FUN_DECL){
-                if(fast_numeric && fast_num_fun(&fast_ctx,s->fun_name)==s){
+                int is_fast_fn = fast_num_fun(&fast_ctx,s->fun_name)==s;
+                if(is_fast_fn){
                     fprintf(fp,"static alt_fastnum_t _alt_fast_fn_%s(",s->fun_name);
                     for(int pi=0;pi<s->nparam;pi++){
                         if(pi>0) fprintf(fp,",");
-                        fprintf(fp,"alt_fastnum_t %s",fast_num_name(s->param_names[pi]));
-                    }
-                    fprintf(fp,");\n");
-                } else {
-                    fprintf(fp,"AltairVal *");
-                    fprintf(fp," _fn_%s(",s->fun_name);
-                    for(int pi=0;pi<s->nparam;pi++){
-                        if(pi>0) fprintf(fp,",");
-                        fprintf(fp,"AltairVal *_p_%s",s->param_names[pi]);
+                        VType pt=s->param_types[pi];
+                        if(pt==VTYPE_LIST||pt==VTYPE_TEXT||pt==VTYPE_OBJECT)
+                            fprintf(fp,"AltairVal *_p_%s",s->param_names[pi]);
+                        else
+                            fprintf(fp,"alt_fastnum_t %s",fast_num_name(s->param_names[pi]));
                     }
                     fprintf(fp,");\n");
                 }
+                fprintf(fp,"AltairVal *");
+                fprintf(fp," _fn_%s(",s->fun_name);
+                for(int pi=0;pi<s->nparam;pi++){
+                    if(pi>0) fprintf(fp,",");
+                    fprintf(fp,"AltairVal *_p_%s",s->param_names[pi]);
+                }
+                fprintf(fp,");\n");
             }
 
             if(s->kind==ND_ROUTE){
@@ -2222,10 +2853,12 @@ void codegen_emit(ASTNode *program, FILE *fp,
         for(int i=0;i<body->nchildren;i++){
             ASTNode *s=body->children[i];
             if(s&&s->kind==ND_FUN_DECL){
-                if(fast_numeric && fast_num_fun(&fast_ctx,s->fun_name)==s)
+                if(fast_num_fun(&fast_ctx,s->fun_name)==s){
                     fast_num_fun_emit(&g,s,&fast_ctx);
-                else
+                    fast_num_fun_emit_bridge(&g,s);
+                } else {
                     cg_fun(&g,s);
+                }
             }
         }
     }
@@ -2259,7 +2892,16 @@ void codegen_emit(ASTNode *program, FILE *fp,
         if(fast_numeric){
             FastNumCtx *saved_fast_ctx=fast_num_emit_ctx;
             fast_num_emit_ctx=&fast_ctx;
+            int saved_ncfn=g.n_cur_fast_names;
+            char saved_cfn[256][128];
+            memcpy(saved_cfn, g.cur_fast_names, sizeof(saved_cfn));
+            g.n_cur_fast_names=0;
+            for(int i=0;i<fast_ctx.n && g.n_cur_fast_names<256;i++)
+                if(!is_pointed_name(fast_ctx.names[i]))
+                    strncpy(g.cur_fast_names[g.n_cur_fast_names++],fast_ctx.names[i],127);
             fast_num_stmt(&g,body);
+            g.n_cur_fast_names=saved_ncfn;
+            memcpy(g.cur_fast_names, saved_cfn, sizeof(saved_cfn));
             fast_num_emit_ctx=saved_fast_ctx;
         } else {
             for(int i=0;i<body->nchildren;i++){
@@ -2269,6 +2911,10 @@ void codegen_emit(ASTNode *program, FILE *fp,
                    s->kind==ND_ROUTE||s->kind==ND_MIDDLEWARE||
                    s->kind==ND_JOB||s->kind==ND_ON_SHUTDOWN||
                    s->kind==ND_LINK ) continue;
+                if(is_empty_list_decl(s)){
+                    int consumed=try_fast_append_loop(&g,body,i);
+                    if(consumed>0){ i += consumed-1; continue; }
+                }
                 cg_stmt(&g,s);
             }
         }
@@ -2276,7 +2922,6 @@ void codegen_emit(ASTNode *program, FILE *fp,
 
     if(g.use_raylib && has_audio) emitln(&g,"CloseAudioDevice();");
     if(g.use_raylib) emitln(&g,"CloseWindow();");
-    global_release_all(&g);
     emitln(&g,"altair_shutdown();");
 #ifdef _WIN32
 

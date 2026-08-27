@@ -1,4 +1,4 @@
-# Altair Compiler v1.8 - Makefile
+# Altair Compiler v1.8.5 - Makefile
 CC      = gcc
 CFLAGS  = -O3 -flto -fomit-frame-pointer -Wall -Wextra -std=c11 \
           -Wno-unused-parameter \
@@ -21,7 +21,7 @@ all: altairc
 altairc: $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ -lm -flto
 	@echo ""
-	@echo "  altairc 1.8 built. Usage: ./altairc <program.at> -o <output>"
+	@echo "  altairc 1.8.5 built. Usage: ./altairc <program.at> -o <output>"
 	@echo "  Guide: ./altairc guide"
 	@echo ""
 

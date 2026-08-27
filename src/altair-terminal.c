@@ -12,7 +12,7 @@
 #include <wchar.h>
 #include <shlobj.h>
 
-#define ALTAIR_VERSION_STR   "1.8"
+#define ALTAIR_VERSION_STR   "1.8.5"
 
 #define COL_RESET   "\033[0m"
 #define COL_CYAN    "\033[96m"
