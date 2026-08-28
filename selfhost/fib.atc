@@ -1,0 +1,26 @@
+fun fib -> numeric numeric n;
+    if n < 2;
+        return n
+    break
+    return fib(n - 1) + fib(n - 2)
+break
+
+fun greet -> text text name;
+    return concat("hola, ", name)
+break
+
+numeric i = 0
+log "Fibonacci 0..10:"
+while i < 10;
+    log numstr(fib(i))
+    i = i + 1
+break
+
+log greet("altair self-hosted")
+
+bool ok = 3 < 5
+if ok;
+    log "3 < 5 es verdadero"
+else;
+    log "esto no deberia pasar"
+break

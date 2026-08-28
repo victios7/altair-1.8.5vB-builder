@@ -1,0 +1,23 @@
+fun classify -> text numeric n;
+    if n % 2 == 0;
+        return "par"
+    elif n % 3 == 0;
+        return "multiplo de 3"
+    else;
+        return "otro"
+    break
+break
+
+numeric i = 1
+while i <= 6;
+    log classify(i)
+    i = i + 1
+break
+
+text a = "hola"
+text b = "hola"
+if streq(a, b);
+    log "iguales"
+else;
+    log "distintos"
+break

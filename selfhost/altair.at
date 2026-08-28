@@ -1,0 +1,533 @@
+altair.doc;
+    name = "AltairSelfHost"
+    version = "0.1"
+    author = "Altair"
+create altair.doc
+
+text SRC = ""
+numeric POS = 0
+numeric LEN = 0
+text TK = ""
+text TV = ""
+file OUTF = open_write("/tmp/.altair_selfhost_init")
+
+fun peekc -> text;
+    if POS < LEN;
+        return SRC[POS]
+    break
+    return ""
+break
+
+fun advc -> text;
+    text c = peekc()
+    POS = POS + 1
+    return c
+break
+
+fun is_digit -> bool text c;
+    return c >= "0" && c <= "9"
+break
+
+fun is_alpha -> bool text c;
+    if c >= "a" && c <= "z";
+        return true
+    break
+    if c >= "A" && c <= "Z";
+        return true
+    break
+    return c == "_"
+break
+
+fun is_alnum -> bool text c;
+    if is_digit(c);
+        return true
+    break
+    return is_alpha(c)
+break
+
+fun skip_ws;
+    bool run = true
+    while run;
+        text c = peekc()
+        if c == " " || c == "\n" || c == "\t" || c == "\r" || c == ";";
+            POS = POS + 1
+        elif c == "#";
+            while peekc() != "\n" && POS < LEN;
+                POS = POS + 1
+            break
+        else;
+            run = false
+        break
+    break
+break
+
+fun set_tok text k, text v;
+    TK = k
+    TV = v
+break
+
+fun next_token;
+    skip_ws()
+    if POS >= LEN;
+        set_tok("eof", "")
+        return
+    break
+    text c = peekc()
+    if is_digit(c);
+        text n = ""
+        while is_digit(peekc());
+            n = n + advc()
+        break
+        if peekc() == ".";
+            n = n + advc()
+            while is_digit(peekc());
+                n = n + advc()
+            break
+        break
+        set_tok("num", n)
+        return
+    break
+    if is_alpha(c);
+        text id = ""
+        while is_alnum(peekc());
+            id = id + advc()
+        break
+        set_tok("id", id)
+        return
+    break
+    if c == "\"";
+        advc()
+        text s = ""
+        while peekc() != "\"" && POS < LEN;
+            text ch = advc()
+            if ch == "\\";
+                text esc = advc()
+                if esc == "n";
+                    s = s + "\n"
+                elif esc == "t";
+                    s = s + "\t"
+                elif esc == "\"";
+                    s = s + "\""
+                else;
+                    s = s + esc
+                break
+            else;
+                s = s + ch
+            break
+        break
+        advc()
+        set_tok("str", s)
+        return
+    break
+    advc()
+    if c == "=" && peekc() == "=";
+        advc(); set_tok("op", "=="); return
+    break
+    if c == "!" && peekc() == "=";
+        advc(); set_tok("op", "!="); return
+    break
+    if c == "<" && peekc() == "=";
+        advc(); set_tok("op", "<="); return
+    break
+    if c == ">" && peekc() == "=";
+        advc(); set_tok("op", ">="); return
+    break
+    if c == "-" && peekc() == ">";
+        advc(); set_tok("op", "->"); return
+    break
+    set_tok("op", c)
+break
+
+fun emit text s;
+    write(OUTF, s)
+break
+
+fun advance;
+    next_token()
+break
+
+fun tis -> bool text v;
+    if TK == "op";
+        return TV == v
+    break
+    return TK == "id" && TV == v
+break
+
+fun expect text v;
+    advance()
+break
+
+fun c_str_escape -> text text s;
+    text r = ""
+    numeric i = 0
+    numeric n = length(s)
+    while i < n;
+        text ch = s[i]
+        if ch == "\"";
+            r = r + "\\\""
+        elif ch == "\n";
+            r = r + "\\n"
+        elif ch == "\\";
+            r = r + "\\\\"
+        else;
+            r = r + ch
+        break
+        i = i + 1
+    break
+    return r
+break
+
+fun parse_expr -> text;
+    return parse_or()
+break
+
+fun parse_or -> text;
+    text left = parse_and()
+    while tis("or");
+        advance()
+        text right = parse_and()
+        left = "(" + left + "||" + right + ")"
+    break
+    return left
+break
+
+fun parse_and -> text;
+    text left = parse_not()
+    while tis("and");
+        advance()
+        text right = parse_not()
+        left = "(" + left + "&&" + right + ")"
+    break
+    return left
+break
+
+fun parse_not -> text;
+    if tis("not");
+        advance()
+        text v = parse_not()
+        return "(!" + v + ")"
+    break
+    return parse_cmp()
+break
+
+fun parse_cmp -> text;
+    text left = parse_add()
+    if tis("==") || tis("!=") || tis("<") || tis(">") || tis("<=") || tis(">=");
+        text op = TV
+        advance()
+        text right = parse_add()
+        return "(" + left + op + right + ")"
+    break
+    return left
+break
+
+fun parse_add -> text;
+    text left = parse_mul()
+    while tis("+") || tis("-");
+        text op = TV
+        advance()
+        text right = parse_mul()
+        if op == "+";
+            left = "(" + left + "+" + right + ")"
+        else;
+            left = "(" + left + "-" + right + ")"
+        break
+    break
+    return left
+break
+
+fun parse_mul -> text;
+    text left = parse_unary()
+    while tis("*") || tis("/") || tis("%");
+        text op = TV
+        advance()
+        text right = parse_unary()
+        if op == "%";
+            left = "fmod(" + left + "," + right + ")"
+        else;
+            left = "(" + left + op + right + ")"
+        break
+    break
+    return left
+break
+
+fun parse_unary -> text;
+    if tis("-");
+        advance()
+        text v = parse_unary()
+        return "(-" + v + ")"
+    break
+    return parse_primary()
+break
+
+fun parse_primary -> text;
+    if TK == "num";
+        text v = TV
+        advance()
+        return v
+    break
+    if TK == "str";
+        text v = "\"" + c_str_escape(TV) + "\""
+        advance()
+        return v
+    break
+    if tis("true");
+        advance()
+        return "1"
+    break
+    if tis("false");
+        advance()
+        return "0"
+    break
+    if tis("(");
+        advance()
+        text e = parse_expr()
+        advance()
+        return "(" + e + ")"
+    break
+    text name = TV
+    advance()
+    if tis("(");
+        advance()
+        text args = ""
+        numeric argn = 0
+        while ! tis(")");
+            if argn > 0;
+                advance()
+            break
+            text a = parse_expr()
+            if argn == 0;
+                args = a
+            else;
+                args = args + "," + a
+            break
+            argn = argn + 1
+        break
+        advance()
+        return name + "(" + args + ")"
+    break
+    return name
+break
+
+fun vtype_c -> text text t;
+    if t == "numeric";
+        return "double"
+    break
+    if t == "bool";
+        return "int"
+    break
+    return "char*"
+break
+
+fun parse_stmt;
+    if tis("numeric") || tis("text") || tis("bool");
+        text ty = TV
+        advance()
+        text name = TV
+        advance()
+        advance()
+        text e = parse_expr()
+        emit(vtype_c(ty))
+        emit(" ")
+        emit(name)
+        emit("=(")
+        emit(e)
+        emit(");\n")
+        return
+    break
+
+    if tis("log");
+        advance()
+        text e = parse_expr()
+        emit("printf(\"%s\\n\",(")
+        emit(e)
+        emit("));\n")
+        return
+    break
+
+    if tis("return");
+        advance()
+        if tis(";") || TK == "eof" || tis("break");
+            emit("return;\n")
+        else;
+            text e = parse_expr()
+            emit("return (")
+            emit(e)
+            emit(");\n")
+        break
+        return
+    break
+
+    if tis("if");
+        advance()
+        text cond = parse_expr()
+        emit("if(")
+        emit(cond)
+        emit("){\n")
+        parse_block()
+        while tis("elif");
+            advance()
+            text c2 = parse_expr()
+            emit("} else if(")
+            emit(c2)
+            emit("){\n")
+            parse_block()
+        break
+        if tis("else");
+            advance()
+            emit("} else {\n")
+            parse_block()
+        break
+        emit("}\n")
+        advance()
+        return
+    break
+
+    if tis("while");
+        advance()
+        text cond = parse_expr()
+        emit("while(")
+        emit(cond)
+        emit("){\n")
+        parse_block()
+        emit("}\n")
+        advance()
+        return
+    break
+
+    text name = TV
+    advance()
+    if tis("=");
+        advance()
+        text e = parse_expr()
+        emit(name)
+        emit("=(")
+        emit(e)
+        emit(");\n")
+        return
+    break
+    if tis("(");
+        advance()
+        text args = ""
+        numeric argn = 0
+        while ! tis(")");
+            if argn > 0;
+                advance()
+            break
+            text a = parse_expr()
+            if argn == 0;
+                args = a
+            else;
+                args = args + "," + a
+            break
+            argn = argn + 1
+        break
+        advance()
+        emit(name)
+        emit("(")
+        emit(args)
+        emit(");\n")
+        return
+    break
+break
+
+fun parse_block;
+    bool run = true
+    while run;
+        if tis("break") || TK == "eof" || tis("elif") || tis("else");
+            run = false
+        else;
+            parse_stmt()
+        break
+    break
+break
+
+fun parse_fun;
+    advance()
+    text fname = TV
+    advance()
+    text rettype = "void"
+    if tis("->");
+        advance()
+        rettype = TV
+        advance()
+    break
+    emit(vtype_c(rettype))
+    emit(" ")
+    emit(fname)
+    emit("(")
+    numeric pn = 0
+    while TK == "id" && (TV == "numeric" || TV == "text" || TV == "bool");
+        text pty = TV
+        advance()
+        text pname = TV
+        advance()
+        if pn > 0;
+            emit(",")
+        break
+        emit(vtype_c(pty))
+        emit(" ")
+        emit(pname)
+        pn = pn + 1
+        if tis(",");
+            advance()
+        break
+    break
+    emit("){\n")
+    parse_block()
+    emit("}\n")
+    advance()
+break
+
+fun compile_program;
+    advance()
+    bool run = true
+    while run;
+        if TK == "eof";
+            run = false
+        elif tis("fun");
+            parse_fun()
+        else;
+            emit("int main(){\n")
+            parse_block()
+            emit("return 0;\n}\n")
+            run = false
+        break
+    break
+break
+
+fun emit_prelude;
+    emit("#include <stdio.h>\n")
+    emit("#include <stdlib.h>\n")
+    emit("#include <string.h>\n")
+    emit("#include <math.h>\n")
+    emit("static char*concat(const char*a,const char*b){\n")
+    emit(" size_t la=strlen(a),lb=strlen(b);\n")
+    emit(" char*r=malloc(la+lb+1);\n")
+    emit(" memcpy(r,a,la); memcpy(r+la,b,lb); r[la+lb]=0;\n")
+    emit(" return r;\n}\n")
+    emit("static int streq(const char*a,const char*b){return strcmp(a,b)==0;}\n")
+    emit("static char*numstr(double n){char*b=malloc(32);snprintf(b,32,\"%g\",n);return b;}\n")
+break
+
+fun run_compiler text inpath, text outpath;
+    file f = open(inpath)
+    SRC = read(f)
+    close(f)
+    LEN = length(SRC)
+    POS = 0
+    OUTF = open_write(outpath)
+    emit_prelude()
+    compile_program()
+    close(OUTF)
+break
+
+numeric nargs = argc()
+if nargs < 3;
+    log "uso: altairc-selfhost <entrada.atc> <salida.c>"
+else;
+    text inpath = arg(1)
+    text outpath = arg(2)
+    run_compiler(inpath, outpath)
+    log "OK: compilado a " + outpath
+break

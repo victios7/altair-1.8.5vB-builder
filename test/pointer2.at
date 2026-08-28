@@ -1,0 +1,21 @@
+altair.doc;
+    name = "PointerTest2"
+    version = "1.0"
+    author = "a"
+create altair.doc
+
+p#node n = alloc(64)
+
+p#write(n, 0, 42)
+p#write(n, 1, 100)
+
+numeric a = p#read(n, 0)
+numeric b = p#read(n, 1)
+
+log a
+log b
+log p#bytes(n)
+log p#null(n)
+
+p#free(n)
+log p#null(n)

@@ -1,0 +1,14 @@
+altair.doc;
+    name = "PersistTest"
+    version = "1.0"
+    author = "a"
+create altair.doc
+
+numeric coins = 120 player.coins
+text playerName = "Victor" player.name
+
+log "coins=" + coins
+log "name=" + playerName
+
+coins = coins + 10
+log "coins tras sumar=" + coins

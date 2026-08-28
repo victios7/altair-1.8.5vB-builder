@@ -1,0 +1,32 @@
+link graphics raylib
+
+window
+    title = "Paint Test"
+    width = 800
+    height = 600
+    fps = 60
+create window
+
+loop
+    clear skyblue
+    draw text
+        content = "Altair Graphics v1.6.5vC"
+        x = 10
+        y = 10
+        size = 24
+        color = white
+    create draw
+    draw rect
+        x = 100
+        y = 100
+        width = 200
+        height = 120
+        color = red
+    create draw
+    draw circle
+        x = 500
+        y = 200
+        radius = 60
+        color = gold
+    create draw
+break

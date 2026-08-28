@@ -1,0 +1,120 @@
+#ifndef ALTAIR_LEXER_H
+#define ALTAIR_LEXER_H
+#include <stddef.h>
+typedef enum {
+    TOK_NUMBER, TOK_STRING, TOK_ALTAIR_DOC, TOK_DURATION,
+    TOK_IDENT,
+    TOK_NUMERIC, TOK_TEXT, TOK_BOOL, TOK_LIST, TOK_OBJECT, TOK_TOKEN,
+    TOK_RAM, TOK_DISK, TOK_CACHE, TOK_TEMP, TOK_AUTO,
+    TOK_CONST, TOK_EXPIRE,
+    TOK_IF, TOK_ELIF, TOK_ELSE,
+    TOK_REPEAT, TOK_WHILE, TOK_FOREVER, TOK_EXIT, TOK_WAIT,
+    TOK_ORBIT, TOK_PREFER, TOK_MIGRATE, TOK_WEIGHT,
+    TOK_SNAPSHOT,
+    TOK_FUN, TOK_CLASS, TOK_RETURN,
+    TOK_CREATE, TOK_BREAK, TOK_DEFINE,
+    TOK_FOREACH, TOK_IN,
+    TOK_TRY, TOK_CATCH,
+    TOK_IMPORT, TOK_MODULE, TOK_AS,
+    TOK_TRUE, TOK_FALSE,
+    TOK_LOG, TOK_CALL, TOK_USER, TOK_INPUT,
+    TOK_CHOOSE,
+    TOK_RELEASE,
+
+    TOK_LISTEN,
+    TOK_ROUTE,
+    TOK_MIDDLEWARE,
+    TOK_RESPOND,
+    TOK_STOP,
+    TOK_PARAM,
+    TOK_HEADER_KW,
+    TOK_BODY_KW,
+    TOK_RATE_LIMIT,
+    TOK_PER_MINUTE,
+    TOK_PER_SECOND,
+    TOK_JOB,
+    TOK_EVERY,
+    TOK_SCHEDULE,
+    TOK_HEALTH,
+    TOK_CHECK,
+    TOK_METRICS,
+    TOK_ON_SHUTDOWN,
+    TOK_SESSION,
+    TOK_EXPIRES,
+    TOK_CONFIG,
+    TOK_DEFAULT_KW,
+    TOK_REQUIRED_KW,
+    TOK_ENV_KW,
+    TOK_DB_POOL,
+    TOK_MAX,
+    TOK_CONNECT,
+
+    TOK_LINK,
+    TOK_WINDOW,
+    TOK_LOOP,
+    TOK_DRAW,
+    TOK_IMAGE,
+    TOK_CLEAR,
+    TOK_COLOR_KW,
+    TOK_SOUND,
+    TOK_MUSIC,
+    TOK_PLAY,
+    TOK_PAUSE_KW,
+    TOK_TIMER_KW,
+    TOK_BUTTON,
+    TOK_LABEL_KW,
+    TOK_TEXTBOX,
+    TOK_CHECKBOX,
+    TOK_SLIDER_KW,
+    TOK_PROGRESS_KW,
+    TOK_LISTVIEW,
+    TOK_MENU_KW,
+    TOK_DIALOG,
+    TOK_SCENE_KW,
+    TOK_GOTO_KW,
+    TOK_CURSOR_KW,
+    TOK_ANIMATE,
+    TOK_POPUP,
+    TOK_CANVAS_GFX,
+    TOK_COLUMN,
+    TOK_ROW,
+    TOK_GRID,
+    TOK_KEY_KW,
+    TOK_ARROW,
+
+    TOK_PLUS, TOK_MINUS, TOK_STAR, TOK_SLASH, TOK_PERCENT,
+    TOK_BANG, TOK_AND, TOK_OR,
+    TOK_EQ, TOK_NEQ, TOK_LT, TOK_GT, TOK_LTE, TOK_GTE,
+    TOK_ASSIGN,
+    TOK_PLUS_ASSIGN, TOK_MINUS_ASSIGN, TOK_STAR_ASSIGN,
+    TOK_SLASH_ASSIGN, TOK_PERCENT_ASSIGN,
+    TOK_SEMICOLON, TOK_COMMA, TOK_DOT, TOK_PERCENT_LIT,
+    TOK_LBRACKET, TOK_RBRACKET, TOK_LPAREN, TOK_RPAREN,
+    TOK_AT,
+
+    TOK_CHAR, TOK_FILE, TOK_POINT, TOK_LBA, TOK_HASH, TOK_DATA_KW,
+    TOK_AMP, TOK_PIPE, TOK_CARET, TOK_TILDE, TOK_SHL, TOK_SHR,
+
+    TOK_EOF
+} TokenKind;
+
+typedef struct {
+    TokenKind kind;
+    char      value[512];
+    int       line;
+    int       col;
+} Token;
+
+typedef struct {
+    const char *src;
+    size_t      pos;
+    int         line;
+    int         col;
+    int         prev_was_value;
+} Lexer;
+
+void        lexer_init(Lexer *l, const char *source);
+Token       lexer_next(Lexer *l);
+Token       lexer_peek(Lexer *l);
+const char *tok_kind_str(TokenKind k);
+#endif

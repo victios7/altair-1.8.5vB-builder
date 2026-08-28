@@ -1,0 +1,18 @@
+altair.doc;
+    name = "DataTest"
+    version = "1.0"
+    author = "a"
+create altair.doc
+
+data PlayerSave disk;
+    numeric coins = 120
+    text name = "Victor"
+data create
+
+log "coins=" + coins
+log "name=" + name
+
+coins = coins + 5
+log "coins tras sumar=" + coins
+
+data PlayerSave migrate cache

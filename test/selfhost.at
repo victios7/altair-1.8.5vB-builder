@@ -1,0 +1,45 @@
+altair.doc;
+    name = "SelfhostTest"
+    version = "1.0"
+    author = "Altair"
+create altair.doc
+
+log "== Bitwise =="
+numeric a = 6
+numeric b = 3
+log a & b
+log a | b
+log a ^ b
+log ~a
+log a << 2
+log a >> 1
+
+log "== File I/O =="
+create_file("test/tmp_selfhost.txt")
+file wf = open_write("test/tmp_selfhost.txt")
+write(wf, "hola altair")
+close(wf)
+
+file rf = open("test/tmp_selfhost.txt")
+text code = read(rf)
+close(rf)
+log "leido: " + code
+
+char c = code[0]
+log "primer char: " + c
+
+if file_exists("test/tmp_selfhost.txt");
+    log "el archivo existe"
+break
+
+delete_file("test/tmp_selfhost.txt")
+
+log "== Exec =="
+numeric rc = exec("echo hola desde exec")
+log "exit code: " + rc
+
+log "== Punteros =="
+point@byte p = ptr_alloc(64)
+bool isnull = ptr_is_null(p)
+log "es null: " + isnull
+ptr_free(p)
