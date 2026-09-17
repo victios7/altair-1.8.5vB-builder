@@ -85,12 +85,12 @@ typedef enum {
     VTYPE_LBA,
 } VType;
 
-#define MAX_CHILDREN  1280
-#define MAX_PARAMS     320
-#define MAX_ORBIT      160
-#define MAX_PREFER      80
-#define MAX_CHOOSE_OPT 640
-#define MAX_GFX_PROPS  100
+#define MAX_CHILDREN  1280000
+#define MAX_PARAMS     320000
+#define MAX_ORBIT      160000
+#define MAX_PREFER      8000
+#define MAX_CHOOSE_OPT 64000
+#define MAX_GFX_PROPS  10000
 
 typedef struct ASTNode ASTNode;
 struct ASTNode {
